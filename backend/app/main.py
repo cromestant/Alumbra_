@@ -8,12 +8,15 @@ Request flow (design doc, section 3 "Where the bytes go"):
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+
+from .pipeline import PipelineError, run_ask
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/3gpp", "video/webm"}
@@ -58,6 +61,25 @@ def create_app() -> FastAPI:
             status_code=501,
             content={"status": "not_implemented"},
         )
+
+    @app.post("/ask")
+    async def ask_photo(
+        image: UploadFile = File(...),
+        question: str = Form(""),
+    ) -> JSONResponse:
+        """Snap & ask: JPEG photo + optional question -> grounded answer.
+
+        Response: {answer, behavior, confidence, scene_model, flow} where
+        behavior is ANSWER or ESCALATE.
+        """
+        data = await image.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty image upload")
+        try:
+            result = await asyncio.to_thread(run_ask, data, question or "")
+        except PipelineError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        return JSONResponse(content=result)
 
     return app
 
