@@ -431,7 +431,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun sendPhotoAsk(photoFile: File, transcript: String) {
         val typed = typeField.text.toString().trim()
         val question = typed.ifEmpty { transcript }.ifEmpty { null }
-        showWorking(Spoken.PHOTO_SENT)
+        // Voice path confirms what was heard before sending; typed wins.
+        val heard = if (typed.isBlank() && transcript.isNotBlank()) {
+            Spoken.iHeard(transcript) + " "
+        } else {
+            ""
+        }
+        showWorking(heard + Spoken.PHOTO_SENT)
         // No raw-audio file for photo asks: SpeechRecognizer owns the mic
         // during the window, and concurrent capture is unreliable.
         api.ask(photoFile, question, audio = null, media = null) {
@@ -591,8 +597,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Haptics.pulse(this)
             when (outcome) {
                 is AskOutcome.Ok -> {
+                    // Display wins: the server's question_used is what the
+                    // answer actually addresses (transcripts can differ).
+                    val shown = outcome.result.questionUsed ?: question
                     val record = HistoryStore.add(
-                        this, question, outcome.result, null
+                        this, shown, outcome.result, null,
+                        outcome.result.questionSource,
                     )
                     refreshLastAnswer()
                     announce(Spoken.ANSWER_ARRIVED)

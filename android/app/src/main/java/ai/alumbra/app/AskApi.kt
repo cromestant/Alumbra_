@@ -34,6 +34,8 @@ data class AskResult(
     val confidence: Double,
     val scene: List<SceneEntry>,
     val flow: String?,
+    val questionUsed: String?,
+    val questionSource: String?,
 )
 
 sealed interface AskOutcome {
@@ -207,6 +209,10 @@ class AskApi(baseUrl: String) {
                         confidence = obj.optDouble("confidence", 0.0),
                         scene = scene,
                         flow = obj.optString("flow", null),
+                        questionUsed = obj.optString("question_used", null)
+                            .takeUnless { obj.isNull("question_used") },
+                        questionSource = obj.optString("question_source", null)
+                            .takeUnless { obj.isNull("question_source") },
                     )
                 )
             } catch (e: Exception) {

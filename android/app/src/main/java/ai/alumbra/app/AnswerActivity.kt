@@ -23,6 +23,8 @@ class AnswerActivity : AppCompatActivity() {
     private lateinit var tts: AlumbraTts
     private var answer: String = ""
     private var escalated: Boolean = false
+    private var errored: Boolean = false
+    private var preamble: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Prefs.applyTheme(this)
@@ -47,7 +49,22 @@ class AnswerActivity : AppCompatActivity() {
             statusView.text = getString(R.string.answer_errored)
             answerView.text = record.error
             answer = record.error
+            errored = true
         } else {
+            // The asked question, as the server heard it, above the answer.
+            val questionView: TextView = findViewById(R.id.question_text)
+            if (record.question != null) {
+                questionView.text = record.question
+            } else {
+                questionView.visibility = View.GONE
+            }
+            preamble = when {
+                record.questionSource == "none" ->
+                    Spoken.DIDNT_CATCH_QUESTION
+                record.question != null ->
+                    Spoken.youAsked(record.question)
+                else -> null
+            }
             answer = record.answer.orEmpty()
             escalated = record.behavior == "ESCALATE"
             statusView.text = if (escalated) {
@@ -98,11 +115,20 @@ class AnswerActivity : AppCompatActivity() {
 
     private fun replayAnswer() {
         // Spoken as written: warnings already lead in the backend's text.
+        // No silent fallback: the question preamble always precedes the
+        // answer (escalation line first when escalated).
+        if (errored) {
+            tts.speak(answer)
+            return
+        }
+        val lead = preamble
         if (escalated) {
             tts.speak(Spoken.ESCALATE_LINE)
-            if (answer.isNotBlank()) {
-                tts.speakQueued(answer)
-            }
+            if (lead != null) tts.speakQueued(lead)
+            if (answer.isNotBlank()) tts.speakQueued(answer)
+        } else if (lead != null) {
+            tts.speak(lead)
+            if (answer.isNotBlank()) tts.speakQueued(answer)
         } else {
             tts.speak(answer)
         }

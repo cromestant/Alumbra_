@@ -21,6 +21,12 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
+import wave
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +153,42 @@ JEV_THRESHOLD_CROSSING = 0.5
 JEV_THRESHOLD_CONSUMPTION = 0.5
 JEV_THRESHOLD_DOSING = 0.5
 JEV_THRESHOLD_SIGNAL = 0.5
+JEV_THRESHOLD_NAVIGATION = 0.5
+
+# Part B — navigation helpers.
+NAVIGATION_RE = re.compile(
+    r"\bexit\b|\bleave\b|\bget out\b|\bget to\b|\breach\b|\bwalk\b|"
+    r"\bpath\b|\bstumbl\w*\b|\btrip\b|\bbump\b|"
+    r"\bin my way\b|\bin the way\b",
+    re.IGNORECASE,
+)
+GOAL_WORDS = {
+    "door", "exit", "stairs", "gate", "elevator", "escalator",
+    "hallway", "corridor", "entry", "entrance",
+}
+GOAL_ALIASES = {
+    "exit": ["exit", "door"],
+    "door": ["door"],
+    "entrance": ["entrance", "entry", "door"],
+    "entry": ["entry", "entrance", "door"],
+    "stairs": ["stairs", "step"],
+    "gate": ["gate"],
+    "elevator": ["elevator"],
+    "escalator": ["escalator"],
+    "hallway": ["hallway", "corridor"],
+    "corridor": ["corridor", "hallway"],
+}
+SURFACE_WORDS = {"floor", "ground", "wall", "ceiling", "sky"}
+SIZE_RANK = {"close": 0, "a few steps away": 1, "far": 2}
+
+# Part A — audio question recovery. NOTE: the fix brief names
+# POST /v1/audio/transcriptions, but that path 404s as of 2026-10-26;
+# POST /v1/asr/transcribe (request JSON + audio parts) is the working
+# endpoint and returns {"transcript": ...}. Same model id either way.
+ASR_ENDPOINT = f"{API_BASE.rstrip('/')}/asr/transcribe"
+ASR_MODEL = "muse-voice-transcribe-1.0"
+ASR_TIMEOUT = 30
+FFMPEG = "/usr/bin/ffmpeg"
 JEV_QUESTIONS = {
     "crossing_intent": (
         "Does this question ask for a decision about crossing a street, "
@@ -164,6 +206,12 @@ JEV_QUESTIONS = {
     "signal_intent": (
         "Does this question ask about the state of a traffic light, "
         "pedestrian signal, or crossing signal?"
+    ),
+    # Part B: navigation shapes the answer only — never escalates,
+    # never enters combine_gate.
+    "navigation_intent": (
+        "Does this question ask about walking a path or route, reaching "
+        "a destination on foot, or avoiding obstacles while moving?"
     ),
     # Patch 7: scene classifiers — instrumentation only, never acted on.
     "scene_danger": (
@@ -465,6 +513,70 @@ def is_dosing_question(question: str) -> bool:
     return any(rx.search(q) for rx in DOSING_RES)
 
 
+def is_navigation_question(question: str) -> bool:
+    return bool(NAVIGATION_RE.search(question or ""))
+
+
+def _path_assessment(
+    scene: list[dict[str, Any]], question: str
+) -> dict[str, Any]:
+    """Part B: facts about the route, computed — not free-reasoned.
+
+    Goal: a scene entry named in the question if present, else straight
+    ahead (12 o'clock). On-path: non-surface entries within +-1 hour of
+    the goal's clock and nearer than the goal. Verdict: clear | blocked
+    | no_goal_visible (question names a goal absent from the scene).
+    """
+    words = set(re.findall(r"[a-z]+", (question or "").lower()))
+    goal_words = [w for w in words if w in GOAL_WORDS]
+    goal: dict[str, Any] | None = None
+    if goal_words:
+        cands = []
+        for e in scene:
+            name = str(e.get("name", "")).lower()
+            for w in goal_words:
+                if any(a in name for a in GOAL_ALIASES.get(w, [w])):
+                    cands.append(e)
+                    break
+        if cands:
+            goal = max(cands, key=lambda e: (e["box"][2] - e["box"][0])
+                       * (e["box"][3] - e["box"][1]))
+    if goal_words and goal is None:
+        return {"goal": None, "goal_clock": None,
+                "verdict": "no_goal_visible", "on_path": []}
+    goal_clock = int(goal["clock"]) if goal else 12
+    goal_rank = SIZE_RANK.get(str((goal or {}).get("size_class", "far")), 2)
+
+    def clock_dist(a: int, b: int) -> int:
+        return min(abs(a - b), 12 - abs(a - b))
+
+    on_path = []
+    for e in scene:
+        if goal is not None and e is goal:
+            continue
+        name = str(e.get("name", "")).lower()
+        if any(re.search(r"\b" + re.escape(s) + r"\b", name)
+               for s in SURFACE_WORDS):
+            continue
+        rank = SIZE_RANK.get(str(e.get("size_class", "far")), 2)
+        if clock_dist(int(e.get("clock", 12)), goal_clock) <= 1 \
+                and rank < goal_rank:
+            on_path.append(e)
+    on_path.sort(key=lambda e: SIZE_RANK.get(
+        str(e.get("size_class", "far")), 2))
+    return {
+        "goal": (str(goal["name"]) if goal else None),
+        "goal_clock": goal_clock,
+        "verdict": "clear" if not on_path else "blocked",
+        "on_path": [
+            {"name": str(e.get("name", "")),
+             "clock": int(e.get("clock", 12)),
+             "size_class": str(e.get("size_class", ""))}
+            for e in on_path
+        ],
+    }
+
+
 def extract_target(question: str) -> str | None:
     """Noun phrase after a locate verb, minus articles and trailing clauses."""
     for rx in LOCATE_RES:
@@ -568,6 +680,75 @@ def jev_enabled() -> bool:
     ):
         return False
     return bool(_load_secret("JEV_API_KEY"))
+
+
+def audio_enabled() -> bool:
+    """Kill switch mirrors jev_enabled(): AUDIO_QUESTION_ENABLED=0 off."""
+    return os.environ.get("AUDIO_QUESTION_ENABLED", "").strip().lower() not in (
+        "0", "false", "no", "off"
+    )
+
+
+def to_wav_16k_mono(data: bytes) -> bytes | None:
+    """16 kHz mono WAV for ASR. Already-there input passes through;
+    anything else goes through ffmpeg (mirrors audio_probe.extract).
+    None on any failure — the ask never fails for audio reasons."""
+    try:
+        with wave.open(io.BytesIO(data), "rb") as w:
+            if (w.getframerate() == 16000 and w.getnchannels() == 1
+                    and w.getsampwidth() == 2):
+                return data
+    except Exception:
+        pass
+    ffmpeg = FFMPEG if os.path.exists(FFMPEG) else shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "in")
+            dst = os.path.join(td, "out.wav")
+            with open(src, "wb") as f:
+                f.write(data)
+            subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-i", src,
+                 "-vn", "-ac", "1", "-ar", "16000", dst],
+                timeout=60, check=True,
+            )
+            if not os.path.exists(dst) or os.path.getsize(dst) == 0:
+                return None
+            with open(dst, "rb") as f:
+                return f.read()
+    except Exception:
+        return None
+
+
+def transcribe_audio(wav_bytes: bytes | None) -> str:
+    """Speech -> text via /v1/asr/transcribe. '' on any failure."""
+    if not wav_bytes:
+        return ""
+    try:
+        key = _load_key()
+        if not key:
+            return ""
+        r = requests.post(
+            ASR_ENDPOINT,
+            headers={"Authorization": f"Bearer {key}"},
+            files={
+                "request": (
+                    None,
+                    json.dumps({"model": ASR_MODEL,
+                                "audioEncoding": "WAV"}),
+                    "application/json",
+                ),
+                "audio": ("ask.wav", wav_bytes, "audio/wav"),
+            },
+            timeout=ASR_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return ""
+        return str(r.json().get("transcript", "") or "").strip()
+    except Exception:
+        return ""
 
 
 def jev_state(
@@ -896,7 +1077,11 @@ def flow_c(
     match: dict[str, Any] | None = None
     for (box, conf), label in zip(boxes, labels):
         name = label.strip() or "unreadable label"
-        hit = bool(want) and (want in label.upper() or label.upper() in want)
+        # Empty/failed reads and NONE ("no label readable") never match:
+        # "" is a substring of everything, which caused false matches.
+        lab = label.strip().upper()
+        hit = (bool(want) and lab not in ("", "NONE")
+               and (want in lab or lab in want))
         ent = entry_for(name, box, conf, width, height,
                         label=label, match=hit)
         scene.append(ent)
@@ -927,7 +1112,9 @@ def _answer_instruction(
         "question in plain, spoken-friendly language: short sentences, "
         "concrete directions using the clock-face positions and distances "
         "from the scene model (for example: 'at your 12 o'clock, a few "
-        "steps away'). Do not mention pixels, boxes, or confidence scores."
+        "steps away'). Do not mention pixels, boxes, or confidence scores. "
+        "Background surfaces (floor, ground, wall, ceiling, sky) are "
+        "surroundings — describe them without clock positions."
         f"{extra}\n"
         f"Question: {q}\n"
         f"Scene model: {json.dumps(scene)}"
@@ -976,9 +1163,28 @@ def _hazards_in(scene: list[dict[str, Any]]) -> list[str]:
     return found
 
 
-def run_ask(image: bytes, question: str) -> dict[str, Any]:
-    """Full pipeline: route -> perceive -> gate -> answer -> rules."""
+def run_ask(
+    image: bytes,
+    question: str,
+    media_bytes: bytes | None = None,
+    audio_bytes: bytes | None = None,
+) -> dict[str, Any]:
+    """Full pipeline: question -> route -> perceive -> gate -> answer."""
+    t0 = time.time()
     question = (question or "").strip()
+    # Part A — precedence: text -> audio transcript -> clip transcript.
+    # Lazy: ASR runs only when the text question is empty.
+    question_source = "text" if question else "none"
+    if not question and audio_enabled():
+        if audio_bytes:
+            t = transcribe_audio(to_wav_16k_mono(audio_bytes))
+            if t:
+                question, question_source = t, "audio"
+        if not question and media_bytes:
+            t = transcribe_audio(to_wav_16k_mono(media_bytes))
+            if t:
+                question, question_source = t, "clip"
+    question_used: str | None = question or None
     luminance = mean_luminance(image)
     p85 = p85_luminance(image)
     flow, target = route(question)
@@ -1000,6 +1206,11 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
     jev = jev_intents(jev_state(scene, question, flow, target))
     gate, crossing_like, dosing, consumption = combine_gate(
         question, scene, jev)
+    # Part B — shaping only: never escalates, never gates.
+    navigation = is_navigation_question(question) or (
+        jev is not None
+        and jev.get("navigation_intent", 0) >= JEV_THRESHOLD_NAVIGATION
+    )
 
     hazards = _hazards_in(scene)
     street_scene = any(
@@ -1070,6 +1281,32 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
             " SAFETY: these hazards are present and you MUST name each as "
             f"a warning in the answer: {', '.join(hazards)}."
         )
+    if navigation and not (crossing_like or dosing):
+        assessment = _path_assessment(scene, question)
+        if assessment["verdict"] == "no_goal_visible":
+            extra += (
+                " NAVIGATION: this is a path question but the goal is not "
+                "visible in this photo: say the exit is not visible in "
+                "this photo and never invent one. Mention visible items "
+                "only briefly as orientation landmarks."
+            )
+        else:
+            goal_txt = assessment["goal"] or "the way ahead"
+            obs = "; ".join(
+                f"{o['name']} at {o['clock']} o'clock, {o['size_class']}"
+                for o in assessment["on_path"]
+            ) or "none"
+            extra += (
+                " NAVIGATION: this is a path question. Facts: goal "
+                f"{goal_txt} at {assessment['goal_clock']} o'clock; "
+                f"verdict {assessment['verdict']}; on-path obstacles: "
+                f"{obs}. You MUST (a) lead with the verdict sentence: "
+                "'Yes — the way to the goal is clear.' if clear, or "
+                "'Careful — <obstacle> is in your path at <clock> "
+                "o'clock.' if blocked; (b) name on-path obstacles with "
+                "clock-face direction and distance; (c) mention off-path "
+                "items only briefly as orientation landmarks."
+            )
     if flow == "C" and match is None:
         extra += (
             " The requested item could NOT be confirmed from any readable "
@@ -1149,7 +1386,7 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
         if not any(h in answer.lower() for h in DARK_HEDGES):
             answer = f"{answer} {DARK_APPEND}"
 
-    return {
+    result = {
         "answer": answer,
         "behavior": behavior,
         "confidence": round(float(confidence), 3),
@@ -1158,4 +1395,24 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
         "gate": gate,
         "signals": {"mean_luminance": round(luminance, 2),
                     "p85_luminance": p85},
+        "question_used": question_used,
+        "question_source": question_source,
     }
+    # Part C — one log line per ask (question text is the user's own
+    # words to their own server; keys never appear here).
+    seen: list[str] = []
+    for e in scene:
+        n = str(e.get("name", "")).strip()
+        if n and n.lower() not in [x.lower() for x in seen]:
+            seen.append(n)
+    print(json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "question": question_used,
+        "question_source": question_source,
+        "flow": flow,
+        "behavior": behavior,
+        "gate": gate,
+        "scene_objects": seen,
+        "latency_ms": int((time.time() - t0) * 1000),
+    }), flush=True)
+    return result

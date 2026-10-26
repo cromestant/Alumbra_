@@ -10,6 +10,7 @@ data class HistoryRecord(
     val id: Long,
     val timestamp: Long,
     val question: String?,
+    val questionSource: String?,
     val answer: String?,
     val behavior: String?,
     val confidence: Double?,
@@ -30,6 +31,7 @@ object HistoryStore {
         question: String?,
         result: AskResult?,
         error: String?,
+        questionSource: String? = null,
     ): HistoryRecord {
         val records = list(context).toMutableList()
         val sceneJson = result?.let {
@@ -48,6 +50,7 @@ object HistoryStore {
             id = System.currentTimeMillis(),
             timestamp = System.currentTimeMillis(),
             question = question,
+            questionSource = questionSource,
             answer = result?.answer,
             behavior = result?.behavior,
             confidence = result?.confidence,
@@ -63,6 +66,7 @@ object HistoryStore {
                     .put("id", r.id)
                     .put("timestamp", r.timestamp)
                     .put("question", r.question ?: JSONObject.NULL)
+                    .put("questionSource", r.questionSource ?: JSONObject.NULL)
                     .put("answer", r.answer ?: JSONObject.NULL)
                     .put("behavior", r.behavior ?: JSONObject.NULL)
                     .put("confidence", r.confidence ?: JSONObject.NULL)
@@ -86,6 +90,8 @@ object HistoryStore {
                     timestamp = o.optLong("timestamp", 0),
                     question = o.optString("question", null)
                         .takeUnless { o.isNull("question") },
+                    questionSource = o.optString("questionSource", null)
+                        .takeUnless { o.isNull("questionSource") },
                     answer = o.optString("answer", null)
                         .takeUnless { o.isNull("answer") },
                     behavior = o.optString("behavior", null)

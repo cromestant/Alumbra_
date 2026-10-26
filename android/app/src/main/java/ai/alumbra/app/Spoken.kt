@@ -28,6 +28,11 @@ object Spoken {
     const val RECOGNIZER_UNAVAILABLE =
         "Voice recognition is not available. Type your question instead."
     const val GETTING_HELP = "Getting help."
+    const val DIDNT_CATCH_QUESTION =
+        "I didn't catch a question, so I described the scene."
+
+    fun youAsked(question: String): String = "You asked: $question"
+    fun iHeard(transcript: String): String = "I heard: $transcript"
     const val WHAT_I_SAW_SHOW = "What I saw. Show details."
     const val WHAT_I_SAW_HIDE = "What I saw. Hide details."
     const val ASK_LIVE_IDLE = "Hold the button to record a clip, or tap " +

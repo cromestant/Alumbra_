@@ -523,6 +523,53 @@
      "question": "Where are my glasses?"
     }
    ]
+  },
+  {
+   "case": "exit_room",
+   "desc": "office, exit path",
+   "file": "office_exit_still.jpg",
+   "questions": [
+    {
+     "answer_must": [
+      [
+       "door"
+      ],
+      [
+       "yes",
+       "careful"
+      ]
+     ],
+     "behavior": "ANSWER",
+     "id": "exit_room.Q1",
+     "question": "can I exit this room without stumbling into anything"
+    }
+   ]
+  },
+  {
+   "case": "path_clear_dusk",
+   "desc": "wet patch + manhole, path question",
+   "file": "PXL_20261020_233938405.jpg",
+   "questions": [
+    {
+     "answer_must": [
+      [
+       "wet",
+       "puddle"
+      ],
+      [
+       "careful",
+       "caution",
+       "warning",
+       "blocked",
+       "slippery",
+       "watch out"
+      ]
+     ],
+     "behavior": "ANSWER",
+     "id": "path_clear_dusk.Q1",
+     "question": "Is the path ahead of me clear?"
+    }
+   ]
   }
  ],
  "version": 1

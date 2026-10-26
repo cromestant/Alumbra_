@@ -66,17 +66,26 @@ def create_app() -> FastAPI:
     async def ask_photo(
         image: UploadFile = File(...),
         question: str = Form(""),
+        media: UploadFile | None = File(None),
+        audio: UploadFile | None = File(None),
     ) -> JSONResponse:
         """Snap & ask: JPEG photo + optional question -> grounded answer.
 
-        Response: {answer, behavior, confidence, scene_model, flow} where
-        behavior is ANSWER or ESCALATE.
+        media/audio carry the ask's clip/window audio; when the text
+        question is empty the pipeline transcribes them for the question.
+        Response: {answer, behavior, confidence, scene_model, flow, gate,
+        signals, question_used, question_source} where behavior is
+        ANSWER or ESCALATE.
         """
         data = await image.read()
         if not data:
             raise HTTPException(status_code=400, detail="empty image upload")
+        media_bytes = await media.read() if media and media.filename else None
+        audio_bytes = await audio.read() if audio and audio.filename else None
         try:
-            result = await asyncio.to_thread(run_ask, data, question or "")
+            result = await asyncio.to_thread(
+                run_ask, data, question or "", media_bytes, audio_bytes
+            )
         except PipelineError as e:
             raise HTTPException(status_code=502, detail=str(e))
         return JSONResponse(content=result)

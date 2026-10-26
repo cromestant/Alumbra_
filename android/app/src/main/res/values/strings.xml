@@ -24,6 +24,7 @@
     <string name="cancel_label">Cancel</string>
 
     <string name="answer_status_description">Answer status</string>
+    <string name="question_asked_description">The question that was answered</string>
     <string name="answer_missing">That answer is no longer available.</string>
     <string name="answer_errored">This ask failed.</string>
     <string name="answer_ready">Answer ready.</string>
