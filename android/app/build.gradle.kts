@@ -43,4 +43,10 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.video)
     implementation(libs.androidx.camera.view)
+    // ExtensionsManager for the first-launch capability probe (Night/HDR).
+    // Flagged per brief: second declared dep after OkHttp, same CameraX set.
+    implementation(libs.androidx.camera.extensions)
+
+    // HTTP client for POST /ask (multipart + long timeouts).
+    implementation(libs.squareup.okhttp)
 }

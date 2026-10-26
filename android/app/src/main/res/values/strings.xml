@@ -1,9 +1,56 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Alumbra</string>
-    <string name="record_button_label">Hold to record</string>
-    <string name="record_button_description">Hold to record a video clip</string>
-    <string name="status_description">Recording status</string>
-    <string name="status_idle">Press and hold the button to record a clip.</string>
-    <string name="status_recording">Recording… release the button to send.</string>
+    <string name="record_button_label">Hold to record, tap for photo</string>
+    <string name="record_button_description">Ask button. Tap for a photo question, press and hold to record a video clip question.</string>
+    <string name="status_description">Status</string>
+    <string name="status_idle">Hold the button to record a clip, or tap it for a photo question.</string>
+    <string name="preview_description">Camera preview</string>
+    <string name="type_field_description">Type your question instead of speaking it</string>
+    <string name="type_field_hint">Type instead (optional)</string>
+    <string name="replay_description">Replay the last answer</string>
+    <string name="replay_label">Replay</string>
+    <string name="torch_label">Torch</string>
+    <string name="torch_description_off">Torch is off. Activate to turn it on.</string>
+    <string name="torch_description_on">Torch is on. Activate to turn it off.</string>
+    <string name="history_description">Open ask history</string>
+    <string name="history_label">History</string>
+    <string name="settings_description">Open settings</string>
+    <string name="settings_label">Settings</string>
+    <string name="no_answer_yet">No answer yet.</string>
+    <string name="working_description">Working, please wait</string>
+    <string name="working_label">Analyzing…</string>
+    <string name="cancel_description">Cancel waiting for the answer</string>
+    <string name="cancel_label">Cancel</string>
+
+    <string name="answer_status_description">Answer status</string>
+    <string name="answer_missing">That answer is no longer available.</string>
+    <string name="answer_errored">This ask failed.</string>
+    <string name="answer_ready">Answer ready.</string>
+    <string name="getting_help">Getting help.</string>
+    <string name="what_i_saw_description">What I saw, expandable details</string>
+    <string name="what_i_saw_show">What I saw: show</string>
+    <string name="what_i_saw_hide">What I saw: hide</string>
+    <string name="follow_up_description">Ask a follow-up question</string>
+    <string name="follow_up_label">Ask a follow-up</string>
+
+    <string name="history_empty">No asks yet.</string>
+    <string name="history_list_description">Ask history, newest first</string>
+
+    <string name="settings_language">Language</string>
+    <string name="settings_language_description">Voice language</string>
+    <string name="settings_rate">Speech rate</string>
+    <string name="settings_rate_description">Speech rate slider</string>
+    <string name="settings_contrast">High contrast</string>
+    <string name="settings_contrast_description">High contrast toggle</string>
+    <string name="settings_server">Backend server</string>
+    <string name="settings_server_description">Backend base URL</string>
+    <string name="settings_server_hint">http://host:8123</string>
+    <string name="preset_lan_label">LAN</string>
+    <string name="preset_lan_description">Use the LAN address preset</string>
+    <string name="preset_tail_label">Tailscale</string>
+    <string name="preset_tail_description">Use the Tailscale address preset</string>
+    <string name="save_server_label">Save</string>
+    <string name="save_server_description">Save the backend address</string>
+    <string name="settings_camera_tier">Camera tier</string>
 </resources>
