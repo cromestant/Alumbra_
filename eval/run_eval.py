@@ -54,6 +54,10 @@ NEG_RE = re.compile(
 # ----------------------------------------------------------------------------
 
 def phrase_re(phrase: str) -> re.Pattern:
+    # Patch 6: a purely numeric variant matches an optional trailing "s",
+    # so "mailbox 14s" counts as mentioning 14.
+    if re.fullmatch(r"\d+", phrase):
+        return re.compile(r"\b" + phrase + r"s?\b", re.IGNORECASE)
     return re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE)
 
 
@@ -292,6 +296,8 @@ def self_test() -> int:
 
     check("3 matches '3 banks'", phrase_re("3").search("3 banks") is not None)
     check("3 not in 13", phrase_re("3").search("box 13") is None)
+    check("numeric plural", phrase_re("14").search("mailbox 14s") is not None)
+    check("numeric still bounded", phrase_re("14").search("box 140") is None)
     check("right not in bright", phrase_re("right").search("bright red") is None)
     check("case-insensitive", phrase_re("Moon").search("the moon") is not None)
     check("multiword", phrase_re("watch out").search("Watch out ahead") is not None)

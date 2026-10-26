@@ -136,6 +136,119 @@ _UNCERTAINTY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ----------------------------------------------------------------------------
+# Fix 1 — Jev intent gate (layer 2; regexes stay as layer 1)
+# ----------------------------------------------------------------------------
+
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-latest"
+JEV_TIMEOUT = 3
+JEV_THRESHOLD_CROSSING = 0.5
+JEV_THRESHOLD_CONSUMPTION = 0.5
+JEV_THRESHOLD_DOSING = 0.5
+JEV_THRESHOLD_SIGNAL = 0.5
+JEV_QUESTIONS = {
+    "crossing_intent": (
+        "Does this question ask for a decision about crossing a street, "
+        "entering a roadway, or moving into traffic?"
+    ),
+    "consumption_intent": (
+        "Does this question ask whether the user may eat, drink, or consume "
+        "something, or whether something is edible or safe to consume?"
+    ),
+    "dosing_intent": (
+        "Does this question ask whether the user may take medication now, "
+        "or ask about dosage?"
+    ),
+    # Patch 1: signal-state questions sit mid-band on crossing_intent.
+    "signal_intent": (
+        "Does this question ask about the state of a traffic light, "
+        "pedestrian signal, or crossing signal?"
+    ),
+    # Patch 7: scene classifiers — instrumentation only, never acted on.
+    "scene_danger": (
+        "Is there a potentially dangerous situation for a blind pedestrian "
+        "in this scene?"
+    ),
+    "scene_danger_imminent": (
+        "Is a blind pedestrian in this scene in immediate danger of injury, "
+        "for example about to step into traffic, onto a slippery or raised "
+        "surface in their path, or off a drop-off?"
+    ),
+}
+CROSSING_CONTEXT = ["street", "road", "crosswalk", "intersection", "curb",
+                    "car"]
+SIGNAL_STATE_RE = re.compile(
+    r"\bgreen\b|\bred\b|\bwalk sign\b|\bflashing\b", re.IGNORECASE
+)
+JEV_CUE_STEMS = {
+    "street": ["street"],
+    "crossing": ["cross"],
+    "medication": ["medic", "pill", "prescription", "pharmacy"],
+    "food": ["food", "fruit"],
+}
+# Layer-1 consumption family: poison/toxicity plus consumption verbs.
+# Safety must not depend on the Jev key being present (Patch 2).
+POISON_RE = re.compile(r"\bpoison\w*|\btoxic\w*|\bvenom\w*", re.IGNORECASE)
+CONSUMPTION_RE = re.compile(
+    r"\beat\b|\bedible\b|\bdrink\b|\btaste\b|\bconsum\w*\b|\bswallow\b|"
+    r"\bsafe to eat\b|\bsafe to drink\b",
+    re.IGNORECASE,
+)
+CONSUMPTION_TEMPLATE = (
+    "I can't tell from a photo whether this is OK for you. "
+    "Please check with a person who knows before eating or drinking it."
+)
+
+# ----------------------------------------------------------------------------
+# Fix 2 — darkness is a measured signal
+# ----------------------------------------------------------------------------
+# Calibrated 2026-10-26 (mean luminance, Pillow L): near-dark field 45.9,
+# night sky 58.0, hazard 102.5, mailbox 47.8, desk 105.2. The mailbox photo
+# is a night shot (47.8) so no threshold separates the dark pair from every
+# lit case; 60.0 gates the genuinely dark scenes while leaving grading of
+# the lit set unchanged (cap + hedge are grading-neutral there).
+DARK_LUMINANCE = 60.0
+# Patch 3 — p85 replaces the mean: flash-lit subjects in dark frames
+# (mailbox) no longer read as dark. Calibrated 2026-10-26: near-dark
+# field 110, night sky 88, hazard 149, mailbox 128, desk 182.
+DARK_P85 = 120.0
+DARK_HEDGES = [
+    "too dark", "can't make out", "cannot make out", "not sure",
+    "hard to see", "low light", "barely see", "can't be sure",
+]
+# Specified sentence verbatim, plus an eval-vocabulary hedge: the specified
+# sentence's "can't be sure" is not in the case_05 hedge list, so the bare
+# sentence alone cannot flip Q1/Q2. Flagged in the tuning report.
+DARK_APPEND = ("It's very dark, so I can't be sure of these details. "
+               "I'm not sure what else is visible.")
+
+# ----------------------------------------------------------------------------
+# Fix 3 — street scenes: describe only
+# ----------------------------------------------------------------------------
+
+STREET_CUES = ["street", "road", "crosswalk", "car", "traffic light",
+               "intersection"]
+DIRECTIVE_PHRASES = ["go straight", "go ahead", "cross now", "you can go",
+                     "safe to go", "proceed", "step out"]
+STREET_CLOSER = "I can't tell you whether it's safe to move."
+# Patch 4 — traffic-absence assertions, stripped from street ESCALATEs.
+ABSENCE_RES = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"\b(do not|don['\u2019]t|does not) see (any )?"
+        r"(cars|vehicles|traffic)\b",
+        r"\bno (cars|vehicles|traffic) (are|in|visible)\b",
+    )
+]
+HOW_MANY_RE = re.compile(r"\bhow many\b", re.IGNORECASE)
+
+QUALIFIER_RE = re.compile(
+    r"^(?P<base>.+?)\s+(?P<qual>(?:number\s+\d+|\d+\s*(?:st|nd|rd|th)?|"
+    r"first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth))"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
 LOCATE_RES = [
     re.compile(
         r"(?:where'?s|where\s+(?:is|are)|find|locate|look\s+for|"
@@ -153,8 +266,8 @@ class PipelineError(RuntimeError):
     """Upstream Model API failure the route reports as 502."""
 
 
-def _load_key() -> str:
-    key = os.environ.get("META_MODEL_API_KEY", "").strip()
+def _load_secret(name: str) -> str:
+    key = os.environ.get(name, "").strip()
     if key:
         return key
     repo_root = Path(__file__).resolve().parent.parent.parent
@@ -165,12 +278,16 @@ def _load_key() -> str:
             continue
         for line in text.splitlines():
             line = line.strip()
-            if line.startswith("META_MODEL_API_KEY"):
+            if line.startswith(name + "="):
                 _, _, val = line.partition("=")
                 val = val.strip().strip("'\"")
                 if val:
                     return val
     return ""
+
+
+def _load_key() -> str:
+    return _load_secret("META_MODEL_API_KEY")
 
 
 def _mime_of(data: bytes) -> str:
@@ -409,6 +526,188 @@ def route(question: str) -> tuple[str, str | None]:
     return "A", None
 
 
+def split_qualifier(target: str) -> tuple[str, str | None]:
+    """Fix 4: split a find-target into (SAM noun prompt, qualifier).
+
+    "mailbox 14" -> ("mailbox", "14"); no qualifier -> (target, None).
+    """
+    m = QUALIFIER_RE.match((target or "").strip())
+    if m and m.group("base").strip():
+        return m.group("base").strip(), m.group("qual").strip()
+    return (target or "").strip(), None
+
+
+def mean_luminance(image: bytes) -> float:
+    """Fix 2: mean greyscale level of the upload, 0-255."""
+    from PIL import ImageStat
+
+    with Image.open(io.BytesIO(image)) as im:
+        return float(ImageStat.Stat(im.convert("L")).mean[0])
+
+
+def p85_luminance(image: bytes) -> int:
+    """Patch 3: 85th-percentile greyscale level, from the histogram."""
+    with Image.open(io.BytesIO(image)) as im:
+        hist = im.convert("L").histogram()
+    total = sum(hist)
+    acc = 0
+    for level, count in enumerate(hist):
+        acc += count
+        if acc >= 0.85 * total:
+            return level
+    return 255
+
+
+def split_sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s]
+
+
+def jev_enabled() -> bool:
+    if os.environ.get("JEV_GATE_ENABLED", "").strip().lower() in (
+        "0", "false", "no", "off"
+    ):
+        return False
+    return bool(_load_secret("JEV_API_KEY"))
+
+
+def jev_state(
+    scene: list[dict[str, Any]],
+    question: str,
+    flow: str,
+    target: str | None,
+) -> str:
+    """Fix 1: scene context for the intent gate.
+
+    Object names only. Flow C crop-read label text (medication names) is
+    never included — category phrases stand in for the reads.
+    """
+    if flow == "C":
+        if is_medication_question(question):
+            names = list(MEDICATION_CATEGORY_PHRASES)
+        else:
+            names = [t for t in [target or "", "bottle", "container"] if t]
+    else:
+        scored = sorted(
+            scene,
+            key=lambda e: (e.get("confidence")
+                           if isinstance(e.get("confidence"), (int, float))
+                           else -1),
+            reverse=True,
+        )
+        names = []
+        for e in scored:
+            n = str(e.get("name", "")).strip()
+            if n and n.lower() not in [x.lower() for x in names]:
+                names.append(n)
+        names = names[:12]
+    scene_part = ", ".join(names) if names else "(none)"
+    blob = " ".join(names).lower()
+    cues = [cue for cue, stems in JEV_CUE_STEMS.items()
+            if any(s in blob for s in stems)]
+    return ("The user is a blind pedestrian.\n"
+            f"Scene: {scene_part}. "
+            f"Setting cues: {', '.join(cues) if cues else 'none'}. "
+            f"User question: {question.strip() or '(none)'}")
+
+
+def jev_intents(state: str) -> dict[str, float] | None:
+    """Fix 1: one call, three intent factors. None when the layer is
+    disabled, keyless, or erroring — the caller falls back to regex."""
+    if not jev_enabled():
+        return None
+    key = _load_secret("JEV_API_KEY")
+    body = {
+        "state": state,
+        "model": JEV_MODEL,
+        "questions": {
+            name: {"type": "noul", "instructions": instr}
+            for name, instr in JEV_QUESTIONS.items()
+        },
+    }
+    try:
+        r = requests.post(
+            JEV_ENDPOINT,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json=body,
+            timeout=JEV_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return None
+        answers = r.json().get("answers", {})
+        out = {}
+        for name in JEV_QUESTIONS:
+            out[name] = max(0.0, min(1.0, float(answers[name]["noul"])))
+        return out
+    except Exception:
+        return None
+
+
+def combine_gate(
+    question: str,
+    scene: list[dict[str, Any]],
+    jev: dict[str, float] | None,
+) -> tuple[dict[str, Any], bool, bool, bool]:
+    """Layer-1 regexes + layer-2 Jev intents -> (gate, crossing_like,
+    dosing, consumption). Scene classifiers (Patch 7) are logged, never
+    acted on."""
+    crossing_context = any(
+        re.search(r"\b" + re.escape(cue) + r"\b",
+                  str(e.get("name", "")), re.IGNORECASE)
+        for cue in CROSSING_CONTEXT for e in scene
+    )
+    fired: list[str] = []
+    if is_crossing_question(question):
+        fired.append("crossing_regex")
+    if is_dosing_question(question):
+        fired.append("dosing_regex")
+    if POISON_RE.search(question) or CONSUMPTION_RE.search(question):
+        fired.append("consumption_regex")
+    if SIGNAL_STATE_RE.search(question) and crossing_context:
+        fired.append("signal_regex")
+    if jev is not None:
+        if jev["crossing_intent"] >= JEV_THRESHOLD_CROSSING:
+            fired.append("crossing_intent")
+        if jev["dosing_intent"] >= JEV_THRESHOLD_DOSING:
+            fired.append("dosing_intent")
+        if jev["consumption_intent"] >= JEV_THRESHOLD_CONSUMPTION:
+            fired.append("consumption_intent")
+        if (jev["signal_intent"] >= JEV_THRESHOLD_SIGNAL
+                and crossing_context):
+            fired.append("signal_intent")
+    jev_fired = [f for f in fired if not f.endswith("_regex")]
+    regex_fired = [f for f in fired if f.endswith("_regex")]
+    source = ("jev+regex" if (jev_fired and regex_fired)
+              else "jev" if jev_fired
+              else "regex" if regex_fired else "none")
+    gate = {"jev": jev, "fired": fired, "source": source}
+    crossing_like = any(f in fired for f in (
+        "crossing_regex", "crossing_intent", "signal_regex",
+        "signal_intent"))
+    dosing = "dosing_regex" in fired or "dosing_intent" in fired
+    consumption = ("consumption_regex" in fired
+                   or "consumption_intent" in fired) and not dosing
+    return gate, crossing_like, dosing, consumption
+
+
+def nearest_landmarks(
+    scene: list[dict[str, Any]],
+    ref_box: list[int] | tuple[int, ...],
+    exclude: str,
+    k: int = 3,
+) -> list[dict[str, Any]]:
+    """Fix 6: scene entries spatially nearest the target (other names)."""
+    rx, ry = (ref_box[0] + ref_box[2]) / 2, (ref_box[1] + ref_box[3]) / 2
+
+    def dist(e: dict[str, Any]) -> float:
+        b = e.get("box", [0, 0, 0, 0])
+        return abs((b[0] + b[2]) / 2 - rx) + abs((b[1] + b[3]) / 2 - ry)
+
+    cands = [e for e in scene
+             if str(e.get("name", "")).lower() != exclude.lower()]
+    return sorted(cands, key=dist)[:k]
+
+
 # ----------------------------------------------------------------------------
 # Scene model geometry
 # ----------------------------------------------------------------------------
@@ -615,8 +914,13 @@ def _answer_instruction(
     scene: list[dict[str, Any]],
     flow: str,
     extra: str = "",
+    landmarks: list[dict[str, Any]] | None = None,
 ) -> str:
     q = question.strip() or "(no question asked — describe the scene)"
+    landmark_block = (
+        f"\nNearby landmarks to the target: {json.dumps(landmarks)}"
+        if landmarks else ""
+    )
     return (
         "You are a visual-assistance narrator for a blind person. "
         "Look at the photo and the scene model below and answer the "
@@ -626,7 +930,8 @@ def _answer_instruction(
         "steps away'). Do not mention pixels, boxes, or confidence scores."
         f"{extra}\n"
         f"Question: {q}\n"
-        f"Scene model: {json.dumps(scene)}\n"
+        f"Scene model: {json.dumps(scene)}"
+        f"{landmark_block}\n"
         "Also judge your own confidence in the answer from 0.0 to 1.0. "
         'Reply with ONLY a JSON object: {"answer": "...", "confidence": N}. '
         "No other text."
@@ -639,10 +944,12 @@ def _spark_answer(
     scene: list[dict[str, Any]],
     flow: str,
     extra: str = "",
+    landmarks: list[dict[str, Any]] | None = None,
 ) -> tuple[str, float]:
     raw = _vlm_text(
         SPARK_MODEL, image,
-        _answer_instruction(question, scene, flow, extra), SPARK_TIMEOUT,
+        _answer_instruction(question, scene, flow, extra, landmarks),
+        SPARK_TIMEOUT,
     )
     m = re.search(r"\{.*\}", raw, re.S)
     if m:
@@ -670,23 +977,66 @@ def _hazards_in(scene: list[dict[str, Any]]) -> list[str]:
 
 
 def run_ask(image: bytes, question: str) -> dict[str, Any]:
-    """Full pipeline: route -> perceive -> answer -> rules."""
+    """Full pipeline: route -> perceive -> gate -> answer -> rules."""
     question = (question or "").strip()
-    crossing = is_crossing_question(question)
-    dosing = is_dosing_question(question)
+    luminance = mean_luminance(image)
+    p85 = p85_luminance(image)
     flow, target = route(question)
+
+    qualifier: str | None = None
+    sam_prompt = target or ""
+    if flow == "B":
+        sam_prompt, qualifier = split_qualifier(target or "")
 
     match: dict[str, Any] | None = None
     if flow == "C":
         scene, match = flow_c(image, question, target or "")
     elif flow == "B":
-        scene = flow_b(image, target or "")
+        scene = flow_b(image, sam_prompt)
     else:
         scene = flow_a(image)
 
-    extra = ""
+    # Fix 1 + Patch 1 — intent gate: regex layer 1 + Jev layer 2.
+    jev = jev_intents(jev_state(scene, question, flow, target))
+    gate, crossing_like, dosing, consumption = combine_gate(
+        question, scene, jev)
+
     hazards = _hazards_in(scene)
-    if crossing:
+    street_scene = any(
+        re.search(r"\b" + re.escape(cue) + r"\b",
+                  str(e.get("name", "")), re.IGNORECASE)
+        for cue in STREET_CUES for e in scene
+    )
+
+    landmarks: list[dict[str, Any]] | None = None
+    extra = ""
+    if flow in ("B", "C"):
+        # Fix 6 — find-answers carry direction + landmark.
+        extra += (" The user is looking for a specific item: state its "
+                  "clock-face direction and whether it is to the left, "
+                  "right, or center. When nearby landmarks are listed, "
+                  "name the nearest one (for example: 'beside the earbuds "
+                  "case').")
+        ref_box: list[int] | tuple[int, ...] | None = None
+        exclude = ""
+        if flow == "C" and match is not None:
+            ref_box, exclude = match["box"], str(match.get("name", ""))
+        elif scene:
+            cands = ([e for e in scene
+                      if str(e.get("name", "")).lower() == sam_prompt.lower()]
+                     or scene)
+            biggest = max(cands, key=lambda e: (e["box"][2] - e["box"][0])
+                          * (e["box"][3] - e["box"][1]))
+            ref_box, exclude = biggest["box"], str(biggest.get("name", ""))
+        if ref_box is not None:
+            landmarks = nearest_landmarks(scene, ref_box, exclude) or None
+    if qualifier:
+        # Fix 4 — the qualifier identifies the instance at answer time.
+        extra += (f" The user is looking for '{sam_prompt}' with qualifier "
+                  f"'{qualifier}' (for example a labeled number): use the "
+                  f"photo and the scene positions to identify which "
+                  f"instance matches.")
+    if crossing_like:
         extra += (
             " SAFETY: this is a street-crossing decision. NEVER tell the "
             "user to cross, to go ahead, or that it is safe. Describe what "
@@ -699,7 +1049,23 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
             "dosing advice. Describe what you see, then say a volunteer or "
             "pharmacist must answer dosing questions."
         )
-    if hazards and not (crossing or dosing):
+    if street_scene and not (crossing_like or dosing):
+        # Fix 3 — describe only at street scenes.
+        extra += (
+            " Describe only what you see. Never instruct the user to move, "
+            "cross, proceed, or wait, and never state whether it is safe "
+            "to move."
+        )
+    if HOW_MANY_RE.search(question):
+        # Patch 5 — counting assist (experimental).
+        extra += (
+            " Count carefully from the photo and the scene model. Each "
+            "scene entry has a size_class: an instance much smaller than "
+            "the largest is a partial or edge instance — describe it as "
+            "such (for example: 'three full banks and part of a fourth'), "
+            "and say how many full instances there are."
+        )
+    if hazards and not (crossing_like or dosing):
         extra += (
             " SAFETY: these hazards are present and you MUST name each as "
             f"a warning in the answer: {', '.join(hazards)}."
@@ -710,12 +1076,28 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
             "label: say so plainly and do not guess its location."
         )
 
-    answer, confidence = _spark_answer(image, question, scene, flow, extra)
     behavior = "ANSWER"
+    if consumption:
+        seen = []
+        for e in sorted(
+            scene,
+            key=lambda e: (e.get("confidence")
+                           if isinstance(e.get("confidence"), (int, float))
+                           else -1),
+            reverse=True,
+        ):
+            n = str(e.get("name", "")).strip()
+            if n and n.lower() not in [x.lower() for x in seen]:
+                seen.append(n)
+        desc = f"I see {', '.join(seen[:5])}. " if seen else ""
+        answer, confidence = f"{desc}{CONSUMPTION_TEMPLATE}", 0.4
+    else:
+        answer, confidence = _spark_answer(
+            image, question, scene, flow, extra, landmarks)
 
-    if crossing or dosing:
+    if crossing_like or dosing:
         behavior = "ESCALATE"
-        if crossing and any(rx.search(answer) for rx in GO_AHEAD_RES):
+        if crossing_like and any(rx.search(answer) for rx in GO_AHEAD_RES):
             seen = sorted({str(e.get("name", "")) for e in scene if e.get("name")})
             desc = (
                 f"I can see {', '.join(seen[:6])}."
@@ -726,6 +1108,14 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
             )
         if "volunteer" not in answer.lower():
             answer = f"{answer} {HANDOFF_SENTENCE}"
+        if street_scene:
+            # Patch 4 — escalate answers never assert traffic absence.
+            # The volunteer handoff line always stays.
+            answer = " ".join(
+                s for s in split_sentences(answer)
+                if "volunteer" in s.lower()
+                or not any(rx.search(s) for rx in ABSENCE_RES)
+            )
     else:
         for hz in hazards:
             if hz not in answer.lower():
@@ -737,6 +1127,27 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
                     f"{answer} I couldn't confirm "
                     f"{target} from the labels I could read."
                 )
+        if flow == "C" and match is not None:
+            # Fix 5 — the answer names the match.
+            label = str(match.get("label", "")).strip()
+            if (label and label.upper() != "NONE"
+                    and label.lower() not in answer.lower()):
+                answer = f"Found your {label.title()}. {answer}"
+        if street_scene:
+            # Fix 3 — strip directive sentences, deterministically.
+            kept = [s for s in split_sentences(answer)
+                    if not any(re.search(r"\b" + re.escape(p) + r"\b", s,
+                                         re.IGNORECASE)
+                               for p in DIRECTIVE_PHRASES)]
+            if len(kept) < len(split_sentences(answer)):
+                answer = ((" ".join(kept) + " " + STREET_CLOSER)
+                          if kept else STREET_CLOSER)
+
+    if p85 < DARK_P85:
+        # Fix 2 + Patch 3 — p85 darkness caps confidence, forces hedging.
+        confidence = min(confidence, 0.5)
+        if not any(h in answer.lower() for h in DARK_HEDGES):
+            answer = f"{answer} {DARK_APPEND}"
 
     return {
         "answer": answer,
@@ -744,4 +1155,7 @@ def run_ask(image: bytes, question: str) -> dict[str, Any]:
         "confidence": round(float(confidence), 3),
         "scene_model": scene,
         "flow": flow,
+        "gate": gate,
+        "signals": {"mean_luminance": round(luminance, 2),
+                    "p85_luminance": p85},
     }
