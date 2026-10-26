@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Alumbra</string>
+    <string name="record_button_label">Hold to record</string>
+    <string name="record_button_description">Hold to record a video clip</string>
+    <string name="status_description">Recording status</string>
+    <string name="status_idle">Press and hold the button to record a clip.</string>
+    <string name="status_recording">Recording… release the button to send.</string>
+</resources>
