@@ -85,6 +85,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var manualTorch = false
     private var lastAnswer: String? = null
 
+    // Follow-up mode: re-ask on the cached ask's media (no camera).
+    private var followupAskId: String? = null
+    // Torch lifecycle: the torch's life is the capture's life.
+    private var captureActive = false
+    private var lastLux = Float.MAX_VALUE
+
     private val holdRunnable = Runnable { beginClipRecording() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -122,23 +128,28 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // raise click via performClick below; touchClick dedupes them.
         recordButton.setOnClickListener {
             if (!touchClick) {
-                doPhotoAsk()
+                if (followupAskId != null) doFollowupAsk() else doPhotoAsk()
             }
             touchClick = false
         }
         recordButton.setOnTouchListener { view, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    ensurePermissions {
-                        recordButton.postDelayed(
-                            holdRunnable, HOLD_THRESHOLD_MS
-                        )
+                    // Follow-up mode: no hold-to-record — tap speaks.
+                    if (followupAskId == null) {
+                        ensurePermissions {
+                            recordButton.postDelayed(
+                                holdRunnable, HOLD_THRESHOLD_MS
+                            )
+                        }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     recordButton.removeCallbacks(holdRunnable)
-                    if (clipRecording != null) {
+                    if (followupAskId != null) {
+                        doFollowupAsk()
+                    } else if (clipRecording != null) {
                         finishClipAsk()
                     } else {
                         doPhotoAsk()
@@ -153,6 +164,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         findViewById<Button>(R.id.cancel_button).setOnClickListener {
             api.cancel()
+            endCapture()
             hideWorking()
             announce(Spoken.CANCELLED)
             Haptics.pulse(this)
@@ -170,6 +182,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             manualTorch = true
             setTorch(!torchOn)
             Haptics.pulse(this)
+            announce(if (torchOn) Spoken.TORCH_ON else Spoken.TORCH_OFF)
         }
         findViewById<Button>(R.id.history_button).setOnClickListener {
             startActivity(Intent(this, HistoryActivity::class.java))
@@ -178,9 +191,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        ensurePermissions {
-            bindCamera()
-            runProbeOnce()
+        followupAskId = intent.getStringExtra(EXTRA_FOLLOWUP_ASK_ID)
+        if (followupAskId != null) {
+            styleFollowupButton()
+            if (savedInstanceState == null) {
+                announce(Spoken.FOLLOWUP_IDLE)
+            } else {
+                statusText.text = Spoken.FOLLOWUP_IDLE
+            }
+        } else {
+            ensurePermissions {
+                bindCamera()
+                runProbeOnce()
+            }
         }
     }
 
@@ -197,6 +220,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onPause() {
         super.onPause()
+        endCapture()
         sensorManager?.unregisterListener(this)
     }
 
@@ -205,6 +229,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         handler.removeCallbacksAndMessages(null)
         recognizer?.destroy()
         api.cancel()
+        endCapture()
         tts.shutdown()
         Earcons.release()
         super.onDestroy()
@@ -361,9 +386,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     // -- torch ------------------------------------------------------------
+    // The torch's life is the capture's life: auto-torch may turn on
+    // when capture starts (in the dark) and goes out the moment capture
+    // ends — sent, cancelled, failed, or left. Nothing burns into
+    // Working/Answer. The manual toggle is the user's own outside asks.
 
     private fun setTorch(on: Boolean) {
         torchOn = on
+        Log.i("Alumbra", "torch ${if (on) "on" else "off"}")
         try {
             camera?.cameraControl?.enableTorch(on)
         } catch (e: Exception) {
@@ -374,11 +404,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        if (manualTorch) return
-        if (event.sensor.type == Sensor.TYPE_LIGHT) {
-            setTorch(event.values[0] < DARK_LUX)
+    private fun beginCapture() {
+        captureActive = true
+        if (!manualTorch && lastLux < DARK_LUX) {
+            setTorch(true)
         }
+    }
+
+    private fun endCapture() {
+        captureActive = false
+        manualTorch = false
+        if (torchOn) {
+            setTorch(false)
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type != Sensor.TYPE_LIGHT) return
+        lastLux = event.values[0]
+        if (manualTorch || !captureActive) return
+        setTorch(lastLux < DARK_LUX)
     }
 
     override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) = Unit
@@ -394,6 +439,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             return
         }
         ensurePermissions {
+            beginCapture()
             capture.targetRotation = displayRotation()
             val file = File(
                 cacheDir, "ask_${System.currentTimeMillis()}.jpg"
@@ -405,6 +451,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     override fun onImageSaved(
                         output: ImageCapture.OutputFileResults
                     ) {
+                        // Shot taken: the torch's job is done even
+                        // though the listen window still runs.
+                        endCapture()
                         // Mic goes hot for the listen window: cut any
                         // in-flight utterance, confirm with haptic + cue.
                         tts.stop()
@@ -417,6 +466,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                     override fun onError(exc: ImageCaptureException) {
                         tts.micHot = false
+                        endCapture()
                         Log.e("Alumbra", "photo capture failed", exc)
                         announce(Spoken.PHOTO_FAILED)
                     }
@@ -475,6 +525,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             // Cut any in-flight utterance before the mic opens.
             tts.stop()
             tts.micHot = true
+            beginCapture()
             clipFile = File(cacheDir, "ask_${System.currentTimeMillis()}.mp4")
             clipFinalized = false
             clipError = null
@@ -522,6 +573,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             } catch (e: Exception) {
                 clipRecording = null
                 tts.micHot = false
+                endCapture()
                 Log.e("Alumbra", "clip recording failed", e)
                 announce(Spoken.RECORDING_FAILED)
             }
@@ -537,6 +589,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         recognizer?.stop()
         // Mic closed: stop cue now, speech safe from here on.
         tts.micHot = false
+        // Clip in hand: the torch goes out before Working settles.
+        endCapture()
         Haptics.pulse(this)
         Earcons.stop()
         showWorking(Spoken.CLIP_SENT, Spoken.workingSub(true))
@@ -635,8 +689,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun styleAskButton() {
-        val big = getString(R.string.record_button_big)
-        val small = getString(R.string.record_button_small)
+        styleRecordButton(
+            R.string.record_button_big, R.string.record_button_small
+        )
+    }
+
+    private fun styleFollowupButton() {
+        styleRecordButton(
+            R.string.followup_button_big, R.string.followup_button_small
+        )
+    }
+
+    private fun styleRecordButton(bigRes: Int, smallRes: Int) {
+        val big = getString(bigRes)
+        val small = getString(smallRes)
         val text = "$big\n$small"
         val out = android.text.SpannableString(text)
         out.setSpan(
@@ -659,6 +725,65 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
         )
         recordButton.text = out
+    }
+
+    // -- follow-up (same media, new question, no camera) ---------------------
+
+    private fun doFollowupAsk() {
+        val askId = followupAskId ?: return
+        if (sending || workingOverlay.visibility == LinearLayout.VISIBLE) {
+            return
+        }
+        val typed = typeField.text.toString().trim()
+        if (typed.isNotEmpty()) {
+            sendFollowup(askId, typed)
+            return
+        }
+        // Speak the question: recognizer owns the mic, so it runs hot
+        // (no app voice into the window) with haptic + cue only.
+        tts.stop()
+        tts.micHot = true
+        Haptics.pulse(this)
+        Earcons.start()
+        statusOnly(Spoken.FOLLOWUP_LISTENING)
+        sending = true
+        transcriptArrived = false
+        recognizer = QuestionRecognizer(this) { transcript ->
+            if (transcriptArrived) return@QuestionRecognizer
+            transcriptArrived = true
+            tts.micHot = false
+            Haptics.pulse(this)
+            Earcons.stop()
+            if (transcript.isBlank()) {
+                sending = false
+                announce(Spoken.FOLLOWUP_NONE)
+            } else {
+                sendFollowup(askId, transcript)
+            }
+        }
+        recognizer?.start()
+        handler.postDelayed({
+            if (!transcriptArrived) {
+                recognizer?.stop()
+                // onError("") arrives and completes the path.
+            }
+        }, FOLLOWUP_LISTEN_MS)
+    }
+
+    private fun sendFollowup(askId: String, question: String) {
+        sending = true
+        typeField.setText("")
+        showWorking(Spoken.FOLLOWUP_SENT, Spoken.workingSub(false))
+        api.followup(askId, question) {
+            onAskOutcome(question, it)
+        }
+    }
+
+    private fun exitFollowupMode() {
+        followupAskId = null
+        typeField.setText("")
+        styleAskButton()
+        statusText.text = ""
     }
 
     private fun onAskOutcome(question: String?, outcome: AskOutcome) {
@@ -684,13 +809,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     )
                 }
                 is AskOutcome.Err -> {
+                    // Expired follow-up target: back to a fresh ask —
+                    // the message already says so plainly, no Sorry-wrap.
+                    if (outcome.expired) exitFollowupMode()
                     // History keeps the technical detail; the status
                     // line and voice get plain words only.
                     HistoryStore.add(
                         this, question, null, outcome.message,
                         errorDetail = outcome.detail,
                     )
-                    announce(Spoken.errorDetail(outcome.message))
+                    announce(
+                        if (outcome.expired) outcome.message
+                        else Spoken.errorDetail(outcome.message)
+                    )
                 }
             }
         }
@@ -724,8 +855,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val REQUEST_CODE = 42
         private const val HOLD_THRESHOLD_MS = 400L
         private const val LISTEN_WINDOW_MS = 4000L
+        private const val FOLLOWUP_LISTEN_MS = 6000L
         private const val CLIP_SETTLE_MS = 10000L
         private const val LAST_ANSWER_CHARS = 120
         private const val DARK_LUX = 10.0f
+        const val EXTRA_FOLLOWUP_ASK_ID = "followup_ask_id"
     }
 }

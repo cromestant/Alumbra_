@@ -16,7 +16,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from .pipeline import PipelineError, run_ask
+from .pipeline import FollowupExpired, PipelineError, run_ask, run_followup
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/3gpp", "video/webm"}
@@ -86,6 +86,30 @@ def create_app() -> FastAPI:
             result = await asyncio.to_thread(
                 run_ask, data, question or "", media_bytes, audio_bytes
             )
+        except PipelineError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        return JSONResponse(content=result)
+
+    @app.post("/followup")
+    async def ask_followup(
+        ask_id: str = Form(...),
+        question: str = Form(""),
+        audio: UploadFile | None = File(None),
+    ) -> JSONResponse:
+        """Follow-up on a cached ask: same media, new question.
+
+        No image: perception (naming, segmentation, merging, second
+        looks) is reused from the cached ask. 410 when the ask id is
+        unknown or its 15-minute cache entry expired — the app then
+        says so plainly and offers a fresh ask.
+        """
+        audio_bytes = await audio.read() if audio and audio.filename else None
+        try:
+            result = await asyncio.to_thread(
+                run_followup, ask_id or "", question or "", audio_bytes
+            )
+        except FollowupExpired as e:
+            raise HTTPException(status_code=410, detail=str(e))
         except PipelineError as e:
             raise HTTPException(status_code=502, detail=str(e))
         return JSONResponse(content=result)

@@ -17,6 +17,7 @@ data class HistoryRecord(
     val sceneJson: String,
     val error: String?,
     val errorDetail: String? = null,
+    val askId: String? = null,
 )
 
 /** Plain-JSON history in internal storage. Newest first. No new deps. */
@@ -34,6 +35,7 @@ object HistoryStore {
         error: String?,
         questionSource: String? = null,
         errorDetail: String? = null,
+        askId: String? = result?.askId,
     ): HistoryRecord {
         val records = list(context).toMutableList()
         val sceneJson = result?.let {
@@ -59,6 +61,7 @@ object HistoryStore {
             sceneJson = sceneJson,
             error = error,
             errorDetail = errorDetail,
+            askId = askId,
         )
         records.add(0, record)
         val trimmed = records.take(MAX_RECORDS)
@@ -76,6 +79,7 @@ object HistoryStore {
                     .put("sceneJson", r.sceneJson)
                     .put("error", r.error ?: JSONObject.NULL)
                     .put("errorDetail", r.errorDetail ?: JSONObject.NULL)
+                    .put("askId", r.askId ?: JSONObject.NULL)
             )
         }
         file(context).writeText(arr.toString())
@@ -107,6 +111,8 @@ object HistoryStore {
                         .takeUnless { o.isNull("error") },
                     errorDetail = o.optString("errorDetail", null)
                         .takeUnless { o.isNull("errorDetail") },
+                    askId = o.optString("askId", null)
+                        .takeUnless { o.isNull("askId") },
                 )
             }
         } catch (e: Exception) {

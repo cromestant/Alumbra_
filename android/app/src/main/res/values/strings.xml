@@ -4,6 +4,8 @@
     <string name="record_button_label">Hold to record, tap for photo</string>
     <string name="record_button_big">Tap to ask\nabout a photo</string>
     <string name="record_button_small">Press and hold to record a clip\nwhile you talk</string>
+    <string name="followup_button_big">Tap to speak\nyour follow-up</string>
+    <string name="followup_button_small">Or type below, then tap to send</string>
     <string name="last_answer_label">Last answer</string>
     <string name="working_sub">Sent. This can take up to a minute — I\'ll speak as soon as I know.</string>
     <string name="replay_pill_label">▶ Replay</string>

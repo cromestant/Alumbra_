@@ -31,6 +31,17 @@ object Spoken {
     const val DIDNT_CATCH_QUESTION =
         "I didn't catch a question, so I described the scene."
     const val VOICE_UNAVAILABLE = "Voice unavailable."
+    const val FOLLOWUP_IDLE =
+        "Follow-up. Speak or type your question about the last answer."
+    const val FOLLOWUP_LISTENING = "Listening for your follow-up question."
+    const val FOLLOWUP_SENT = "Follow-up sent, analyzing."
+    const val FOLLOWUP_NONE = "Say or type your follow-up question first."
+    const val ASK_EXPIRED =
+        "That ask has expired. Please ask again as a new question."
+    const val MEDIA_GONE =
+        "That ask's media is gone. Please make a fresh ask."
+    const val TORCH_ON = "Flashlight on."
+    const val TORCH_OFF = "Flashlight off."
     const val CAMERA_UNAVAILABLE = "Camera unavailable."
     const val PHOTO_FAILED = "Photo failed. Try again."
     const val CLIP_FAILED = "Clip failed. Try again."

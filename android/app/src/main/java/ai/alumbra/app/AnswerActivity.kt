@@ -1,11 +1,13 @@
 package ai.alumbra.app
 
+import android.content.Intent
 import android.os.Bundle
 import android.util.TypedValue
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
 /**
@@ -113,7 +115,21 @@ class AnswerActivity : AppCompatActivity() {
             replayAnswer()
         }
         findViewById<Button>(R.id.follow_up_button).setOnClickListener {
-            finish()
+            // Follow-up re-asks on the same media (no recapture). Old
+            // records predate ask ids — say so plainly instead.
+            val askId = record?.askId
+            if (askId.isNullOrEmpty()) {
+                Haptics.pulse(this)
+                tts.speak(Spoken.MEDIA_GONE)
+                Toast.makeText(this, Spoken.MEDIA_GONE, Toast.LENGTH_SHORT)
+                    .show()
+            } else {
+                startActivity(
+                    Intent(this, MainActivity::class.java).putExtra(
+                        MainActivity.EXTRA_FOLLOWUP_ASK_ID, askId
+                    )
+                )
+            }
         }
         findViewById<Button>(R.id.keep_waiting_button).setOnClickListener {
             // v1: no volunteer channel yet — confirm we're still here.

@@ -573,6 +573,40 @@
      "question": "Is the path ahead of me clear?"
     }
    ]
+  },
+  {
+   "case": "fridge_ice",
+   "desc": "kitchen, ice cubes on tile path to fridge",
+   "file": "fridge_ice_test.jpg",
+   "questions": [
+    {
+     "answer_must": [
+      [
+       "ice"
+      ],
+      [
+       "fridge",
+       "refrigerator"
+      ],
+      [
+       "careful",
+       "caution",
+       "warning",
+       "blocked",
+       "slippery",
+       "watch out",
+       "watch your step"
+      ]
+     ],
+     "answer_must_not": [
+      "is clear",
+      "all clear"
+     ],
+     "behavior": "ANSWER",
+     "id": "fridge_ice.Q1",
+     "question": "is the path to the fridge clear?"
+    }
+   ]
   }
  ],
  "version": 1

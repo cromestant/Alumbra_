@@ -36,6 +36,7 @@ data class AskResult(
     val flow: String?,
     val questionUsed: String?,
     val questionSource: String?,
+    val askId: String?,
 )
 
 sealed interface AskOutcome {
@@ -43,18 +44,25 @@ sealed interface AskOutcome {
     /**
      * message is plain words for the status line + voice; detail carries
      * the technical cause for History and logs, never spoken or shown.
+     * expired marks a gone follow-up target (HTTP 410): the app says so
+     * plainly and offers a fresh ask instead of retrying.
      */
-    data class Err(val message: String, val detail: String? = null) :
-        AskOutcome
+    data class Err(
+        val message: String,
+        val detail: String? = null,
+        val expired: Boolean = false,
+    ) : AskOutcome
 }
 
 /**
  * POST {base_url}/ask as multipart: image (required JPEG), question
- * (optional text), audio + media (optional files, ignored by the backend
- * today, consumed by later briefs). Unknown response fields are ignored.
+ * (optional text), audio + media (optional files). POST
+ * {base_url}/followup re-runs the pipeline on a cached ask's media with
+ * a new question (no image). Unknown response fields are ignored.
  */
 class AskApi(baseUrl: String) {
     private val url = baseUrl.trimEnd('/') + "/ask"
+    private val followupUrl = baseUrl.trimEnd('/') + "/followup"
 
     // Eval asks took 8-67s end to end; the Working state is built for it.
     private val client = OkHttpClient.Builder()
@@ -94,16 +102,51 @@ class AskApi(baseUrl: String) {
                 )
             )
         }
-        val request = Request.Builder().url(url).post(form.build()).build()
+        postForm(
+            url, form.build(),
+            "image=${image.name}(${image.length()}B) " +
+                "question=${!question.isNullOrBlank()} " +
+                "audio=${audio?.length()} media=${media?.length()}",
+            mapGone = false,
+            callback = callback,
+        )
+    }
+
+    /**
+     * Follow-up on a cached ask: same media server-side, new question,
+     * no image. 410 means the ask expired out of the server cache.
+     */
+    fun followup(
+        askId: String,
+        question: String?,
+        callback: (AskOutcome) -> Unit,
+    ) {
+        val form = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("ask_id", askId)
+        if (!question.isNullOrBlank()) {
+            form.addFormDataPart("question", question)
+        }
+        postForm(
+            followupUrl, form.build(),
+            "ask_id=${askId.take(8)} " +
+                "question=${!question.isNullOrBlank()}",
+            mapGone = true,
+            callback = callback,
+        )
+    }
+
+    private fun postForm(
+        targetUrl: String,
+        form: MultipartBody,
+        desc: String,
+        mapGone: Boolean,
+        callback: (AskOutcome) -> Unit,
+    ) {
+        val request = Request.Builder().url(targetUrl).post(form).build()
         val newCall = client.newCall(request)
         call = newCall
         val startMs = SystemClock.elapsedRealtime()
-        Log.i(
-            NET_TAG,
-            "POST $url image=${image.name}(${image.length()}B) " +
-                "question=${!question.isNullOrBlank()} " +
-                "audio=${audio?.length()} media=${media?.length()}",
-        )
+        Log.i(NET_TAG, "POST $targetUrl $desc")
         newCall.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 val elapsed = SystemClock.elapsedRealtime() - startMs
@@ -134,12 +177,22 @@ class AskApi(baseUrl: String) {
                             "request failed after ${elapsed}ms: " +
                                 "HTTP ${it.code}",
                         )
-                        callback(
-                            AskOutcome.Err(
-                                Spoken.SERVER_ERROR,
-                                "HTTP ${it.code}",
+                        if (mapGone && it.code == 410) {
+                            callback(
+                                AskOutcome.Err(
+                                    Spoken.ASK_EXPIRED,
+                                    "HTTP 410",
+                                    expired = true,
+                                )
                             )
-                        )
+                        } else {
+                            callback(
+                                AskOutcome.Err(
+                                    Spoken.SERVER_ERROR,
+                                    "HTTP ${it.code}",
+                                )
+                            )
+                        }
                         return
                     }
                     Log.i(
@@ -227,6 +280,8 @@ class AskApi(baseUrl: String) {
                             .takeUnless { obj.isNull("question_used") },
                         questionSource = obj.optString("question_source", null)
                             .takeUnless { obj.isNull("question_source") },
+                        askId = obj.optString("ask_id", null)
+                            .takeUnless { obj.isNull("ask_id") },
                     )
                 )
             } catch (e: Exception) {
