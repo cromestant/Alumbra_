@@ -2,6 +2,18 @@
 <resources>
     <string name="app_name">Alumbra</string>
     <string name="record_button_label">Hold to record, tap for photo</string>
+    <string name="record_button_big">Tap to ask\nabout a photo</string>
+    <string name="record_button_small">Press and hold to record a clip\nwhile you talk</string>
+    <string name="last_answer_label">Last answer</string>
+    <string name="working_sub">Sent. This can take up to a minute — I\'ll speak as soon as I know.</string>
+    <string name="replay_pill_label">▶ Replay</string>
+    <string name="getting_help_title">GETTING HELP</string>
+    <string name="help_waiting">Still trying to reach someone…</string>
+    <string name="describe_prefix">What I can describe:\u0020</string>
+    <string name="keep_waiting_label">Keep waiting</string>
+    <string name="keep_waiting_description">Keep waiting for a volunteer</string>
+    <string name="leave_label">Leave the question</string>
+    <string name="leave_description">Leave this question and go back</string>
     <string name="record_button_description">Ask button. Tap for a photo question, press and hold to record a video clip question.</string>
     <string name="status_description">Status</string>
     <string name="status_idle">Hold the button to record a clip, or tap it for a photo question.</string>
@@ -36,6 +48,8 @@
     <string name="follow_up_label">Ask a follow-up</string>
 
     <string name="history_empty">No asks yet.</string>
+    <string name="tag_volunteer">VOLUNTEER</string>
+    <string name="tag_unanswered">UNANSWERED</string>
     <string name="history_list_description">Ask history, newest first</string>
 
     <string name="settings_language">Language</string>
@@ -54,4 +68,8 @@
     <string name="save_server_label">Save</string>
     <string name="save_server_description">Save the backend address</string>
     <string name="settings_camera_tier">Camera tier</string>
+    <string name="section_speaking">SPEAKING</string>
+    <string name="section_display">DISPLAY</string>
+    <string name="section_service">SERVICE</string>
+    <string name="rate_normal">Normal</string>
 </resources>

@@ -1,14 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Normal: dark slate. High-contrast (default ON): the mock palette. -->
     <style name="Theme.Alumbra" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <item name="warningTextColor">#B26A00</item>
+        <item name="android:windowBackground">@color/alumbra_soft_bg</item>
+        <item name="android:textColor">@color/alumbra_ink</item>
+        <item name="android:textColorPrimary">@color/alumbra_ink</item>
+        <item name="android:textColorSecondary">@color/alumbra_dim</item>
+        <item name="colorPrimary">@color/alumbra_amber</item>
+        <item name="warningTextColor">@color/alumbra_warn</item>
     </style>
     <style name="Theme.Alumbra.HighContrast" parent="Theme.AppCompat.NoActionBar">
-        <item name="android:windowBackground">#000000</item>
-        <item name="android:textColor">#FFFFFF</item>
-        <item name="android:textColorPrimary">#FFFFFF</item>
-        <item name="android:textColorSecondary">#FFFFFF</item>
-        <item name="colorPrimary">#FFD54F</item>
-        <item name="warningTextColor">#FFD54F</item>
+        <item name="android:windowBackground">@color/alumbra_bg</item>
+        <item name="android:textColor">@color/alumbra_ink</item>
+        <item name="android:textColorPrimary">@color/alumbra_ink</item>
+        <item name="android:textColorSecondary">@color/alumbra_dim</item>
+        <item name="colorPrimary">@color/alumbra_amber</item>
+        <item name="warningTextColor">@color/alumbra_warn</item>
     </style>
 </resources>

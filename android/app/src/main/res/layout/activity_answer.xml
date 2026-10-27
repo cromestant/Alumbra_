@@ -8,62 +8,163 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="24dp">
+        android:padding="18dp">
 
         <TextView
-            android:id="@+id/answer_status"
+            android:id="@+id/appname_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:letterSpacing="0.2"
+            android:text="ANSWER"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:id="@+id/helpbox"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:accessibilityLiveRegion="polite"
-            android:contentDescription="@string/answer_status_description"
-            android:textSize="20sp" />
+            android:layout_marginTop="12dp"
+            android:background="@drawable/box_help"
+            android:orientation="vertical"
+            android:padding="16dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:letterSpacing="0.15"
+                android:text="@string/getting_help_title"
+                android:textColor="@color/alumbra_help"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/help_quote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="@color/alumbra_ink"
+                android:textSize="18sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/help_waiting"
+                android:textColor="@color/alumbra_dim"
+                android:textSize="15sp" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/warnbox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/box_warn"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/warn_lines"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/alumbra_ink"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+        </LinearLayout>
 
         <TextView
             android:id="@+id/question_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="12dp"
             android:contentDescription="@string/question_asked_description"
-            android:textSize="20sp" />
+            android:textColor="@color/alumbra_dim"
+            android:textSize="15sp" />
 
         <TextView
             android:id="@+id/answer_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:textSize="26sp" />
+            android:layout_marginTop="8dp"
+            android:accessibilityLiveRegion="polite"
+            android:textColor="@color/alumbra_ink"
+            android:textSize="24sp" />
 
-        <Button
-            android:id="@+id/what_i_saw_button"
+        <ai.alumbra.app.FlowLayout
+            android:id="@+id/saw_chips"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:contentDescription="@string/what_i_saw_description"
-            android:text="@string/what_i_saw_show" />
+            android:layout_marginTop="14dp" />
 
         <LinearLayout
-            android:id="@+id/what_i_saw_list"
+            android:id="@+id/btnrow_normal"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:visibility="gone" />
-
-        <Button
-            android:id="@+id/answer_replay_button"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:contentDescription="@string/replay_description"
-            android:text="@string/replay_label" />
-
-        <Button
-            android:id="@+id/follow_up_button"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="18dp"
             android:layout_marginBottom="16dp"
-            android:contentDescription="@string/follow_up_description"
-            android:text="@string/follow_up_label" />
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/answer_replay_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="5dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/replay_description"
+                android:minHeight="60dp"
+                android:text="@string/replay_label"
+                style="@style/Widget.Alumbra.Button.Outline" />
+
+            <Button
+                android:id="@+id/follow_up_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="5dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/follow_up_description"
+                android:minHeight="60dp"
+                android:text="@string/follow_up_label"
+                style="@style/Widget.Alumbra.Button.Primary" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/btnrow_escalated"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:layout_marginBottom="16dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/keep_waiting_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="5dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/keep_waiting_description"
+                android:minHeight="60dp"
+                android:text="@string/keep_waiting_label"
+                style="@style/Widget.Alumbra.Button.Outline" />
+
+            <Button
+                android:id="@+id/leave_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="5dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/leave_description"
+                android:minHeight="60dp"
+                android:text="@string/leave_label"
+                style="@style/Widget.Alumbra.Button.Outline" />
+
+        </LinearLayout>
 
     </LinearLayout>
 </ScrollView>

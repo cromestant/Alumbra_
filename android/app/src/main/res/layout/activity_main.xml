@@ -3,147 +3,204 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <ScrollView
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:fillViewport="true">
+        android:orientation="vertical"
+        android:padding="18dp">
 
-        <LinearLayout
+        <TextView
+            android:id="@+id/appname_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:letterSpacing="0.2"
+            android:text="ALUMBRA."
+            android:textColor="@color/alumbra_dim"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/record_button"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_marginTop="14dp"
+            android:layout_weight="1"
+            android:background="@drawable/ask_button"
+            android:contentDescription="@string/record_button_description"
+            android:padding="16dp"
+            android:text="@string/record_button_label"
+            android:textAllCaps="false"
+            android:textColor="@color/alumbra_amber_ink" />
+
+        <TextView
+            android:id="@+id/status_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center_horizontal"
+            android:layout_marginTop="10dp"
+            android:accessibilityLiveRegion="polite"
+            android:contentDescription="@string/status_description"
+            android:textAlignment="center"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="15sp" />
+
+        <EditText
+            android:id="@+id/type_field"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/box_type"
+            android:contentDescription="@string/type_field_description"
+            android:hint="@string/type_field_hint"
+            android:inputType="text"
+            android:padding="14dp"
+            android:textColor="@color/alumbra_ink"
+            android:textColorHint="@color/alumbra_dim"
+            android:textSize="17sp" />
+
+        <LinearLayout
+            android:id="@+id/lastans_panel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/panel"
             android:orientation="vertical"
-            android:padding="16dp">
-
-            <androidx.camera.view.PreviewView
-                android:id="@+id/preview_view"
-                android:layout_width="match_parent"
-                android:layout_height="180dp"
-                android:contentDescription="@string/preview_description" />
-
-            <Button
-                android:id="@+id/record_button"
-                android:layout_width="match_parent"
-                android:layout_height="280dp"
-                android:layout_marginTop="12dp"
-                android:contentDescription="@string/record_button_description"
-                android:text="@string/record_button_label"
-                android:textSize="26sp" />
+            android:padding="14dp">
 
             <TextView
-                android:id="@+id/status_text"
-                android:layout_width="match_parent"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:accessibilityLiveRegion="polite"
-                android:contentDescription="@string/status_description"
-                android:text="@string/status_idle"
-                android:textAlignment="center"
-                android:textSize="18sp" />
-
-            <EditText
-                android:id="@+id/type_field"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:contentDescription="@string/type_field_description"
-                android:hint="@string/type_field_hint"
-                android:inputType="text"
-                android:textSize="18sp" />
+                android:text="@string/last_answer_label"
+                android:textColor="@color/alumbra_dim"
+                android:textSize="13sp" />
 
             <TextView
                 android:id="@+id/last_answer_text"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:textSize="18sp" />
+                android:layout_marginTop="4dp"
+                android:textColor="@color/alumbra_ink"
+                android:textSize="16sp" />
 
-            <LinearLayout
-                android:layout_width="match_parent"
+            <Button
+                android:id="@+id/replay_button"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:layout_gravity="end"
                 android:layout_marginTop="8dp"
-                android:gravity="center"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/replay_button"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginEnd="4dp"
-                    android:layout_weight="1"
-                    android:contentDescription="@string/replay_description"
-                    android:text="@string/replay_label" />
-
-                <Button
-                    android:id="@+id/torch_button"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="4dp"
-                    android:layout_marginEnd="4dp"
-                    android:layout_weight="1"
-                    android:contentDescription="@string/torch_description_off"
-                    android:text="@string/torch_label" />
-
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:layout_marginBottom="16dp"
-                android:gravity="center"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/history_button"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginEnd="4dp"
-                    android:layout_weight="1"
-                    android:contentDescription="@string/history_description"
-                    android:text="@string/history_label" />
-
-                <Button
-                    android:id="@+id/settings_button"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="4dp"
-                    android:layout_weight="1"
-                    android:contentDescription="@string/settings_description"
-                    android:text="@string/settings_label" />
-
-            </LinearLayout>
+                android:contentDescription="@string/replay_description"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:paddingLeft="18dp"
+                android:paddingTop="8dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="8dp"
+                android:text="@string/replay_pill_label"
+                style="@style/Widget.Alumbra.Button.Pill" />
 
         </LinearLayout>
-    </ScrollView>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/torch_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/torch_description_off"
+                android:text="@string/torch_label"
+                style="@style/Widget.Alumbra.Button.Slim" />
+
+            <Button
+                android:id="@+id/history_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/history_description"
+                android:text="@string/history_label"
+                style="@style/Widget.Alumbra.Button.Slim" />
+
+            <Button
+                android:id="@+id/settings_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/settings_description"
+                android:text="@string/settings_label"
+                style="@style/Widget.Alumbra.Button.Slim" />
+
+        </LinearLayout>
+
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/working_overlay"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:background="?android:attr/colorBackground"
-        android:gravity="center"
+        android:gravity="center_horizontal"
         android:orientation="vertical"
         android:padding="32dp"
         android:visibility="gone">
+
+        <Space
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/pulse_view"
+            android:layout_width="110dp"
+            android:layout_height="110dp"
+            android:background="@drawable/ring_pulse"
+            android:gravity="center"
+            android:text="◌"
+            android:textColor="@color/alumbra_amber"
+            android:textSize="34sp" />
 
         <TextView
             android:id="@+id/working_text"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
             android:accessibilityLiveRegion="assertive"
             android:contentDescription="@string/working_description"
             android:text="@string/working_label"
-            android:textSize="26sp" />
+            android:textColor="@color/alumbra_ink"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/working_sub"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="@string/working_sub"
+            android:textAlignment="center"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="16sp" />
+
+        <Space
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="2" />
 
         <Button
             android:id="@+id/cancel_button"
             android:layout_width="match_parent"
-            android:layout_height="120dp"
-            android:layout_marginTop="24dp"
+            android:layout_height="wrap_content"
             android:contentDescription="@string/cancel_description"
+            android:minHeight="64dp"
             android:text="@string/cancel_label"
-            android:textSize="24sp" />
+            style="@style/Widget.Alumbra.Button.Outline" />
 
     </LinearLayout>
 

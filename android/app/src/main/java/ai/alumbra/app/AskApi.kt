@@ -40,7 +40,12 @@ data class AskResult(
 
 sealed interface AskOutcome {
     data class Ok(val result: AskResult) : AskOutcome
-    data class Err(val message: String) : AskOutcome
+    /**
+     * message is plain words for the status line + voice; detail carries
+     * the technical cause for History and logs, never spoken or shown.
+     */
+    data class Err(val message: String, val detail: String? = null) :
+        AskOutcome
 }
 
 /**
@@ -108,12 +113,16 @@ class AskApi(baseUrl: String) {
                         "(canceled=${call.isCanceled()}): " +
                         "${e.javaClass.name}: ${e.message}",
                 )
-                val msg = if (call.isCanceled()) {
-                    "Cancelled."
+                if (call.isCanceled()) {
+                    callback(AskOutcome.Err("Cancelled."))
                 } else {
-                    "Could not reach the server (${e.message ?: e})."
+                    callback(
+                        AskOutcome.Err(
+                            Spoken.SERVER_UNREACHABLE,
+                            "${e.javaClass.name}: ${e.message}",
+                        )
+                    )
                 }
-                callback(AskOutcome.Err(msg))
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -125,7 +134,12 @@ class AskApi(baseUrl: String) {
                             "request failed after ${elapsed}ms: " +
                                 "HTTP ${it.code}",
                         )
-                        callback(AskOutcome.Err("Server error ${it.code}."))
+                        callback(
+                            AskOutcome.Err(
+                                Spoken.SERVER_ERROR,
+                                "HTTP ${it.code}",
+                            )
+                        )
                         return
                     }
                     Log.i(
@@ -216,7 +230,15 @@ class AskApi(baseUrl: String) {
                     )
                 )
             } catch (e: Exception) {
-                AskOutcome.Err("Bad server response (${e.message ?: e}).")
+                Log.i(
+                    NET_TAG,
+                    "unparseable response: ${e.javaClass.name}: " +
+                        e.message,
+                )
+                AskOutcome.Err(
+                    Spoken.BAD_RESPONSE,
+                    "${e.javaClass.name}: ${e.message}",
+                )
             }
         }
     }

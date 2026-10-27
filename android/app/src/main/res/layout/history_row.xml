@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="14dp">
+
+    <TextView
+        android:id="@+id/row_q"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="@color/alumbra_ink"
+        android:textSize="17sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/row_a"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/alumbra_dim"
+        android:textSize="15sp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/row_t"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/row_tag_esc"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/tag_esc"
+            android:paddingLeft="10dp"
+            android:paddingTop="4dp"
+            android:paddingRight="10dp"
+            android:paddingBottom="4dp"
+            android:text="@string/tag_volunteer"
+            android:textColor="@color/alumbra_help"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/row_tag_un"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/tag_un"
+            android:paddingLeft="10dp"
+            android:paddingTop="4dp"
+            android:paddingRight="10dp"
+            android:paddingBottom="4dp"
+            android:text="@string/tag_unanswered"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+</LinearLayout>

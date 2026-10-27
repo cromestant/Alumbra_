@@ -1,11 +1,6 @@
 package ai.alumbra.app
 
-import android.graphics.Typeface
 import android.os.Bundle
-import android.text.SpannableString
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
-import android.text.style.StyleSpan
 import android.util.TypedValue
 import android.view.View
 import android.widget.Button
@@ -14,9 +9,11 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
 /**
- * Answer screen: very large type, auto-spoken on arrival, What-I-saw
- * grounding list, and the "getting help" escalation state (verbatim line,
- * descriptive answer kept visible).
+ * Answer screen (mock look): warnbox extracts "Warning:" lines above the
+ * answer, grounding renders as always-visible chips, and ESCALATE swaps
+ * in the helpbox + Keep-waiting/Leave row. Speech order is unchanged:
+ * warnings spoken as written, escalation line first, then the question
+ * preamble, then the answer.
  */
 class AnswerActivity : AppCompatActivity() {
 
@@ -30,29 +27,37 @@ class AnswerActivity : AppCompatActivity() {
         Prefs.applyTheme(this)
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_answer)
+        Ui.applyEdgeToEdge(this)
 
         tts = AlumbraTts(this)
-        val statusView: TextView = findViewById(R.id.answer_status)
         val answerView: TextView = findViewById(R.id.answer_text)
-        val sawButton: Button = findViewById(R.id.what_i_saw_button)
-        val sawList: LinearLayout = findViewById(R.id.what_i_saw_list)
+        // Dead engine: the answer is already on screen; tell TalkBack
+        // the voice is gone so the silence is explained.
+        tts.onVoiceUnavailable = {
+            runOnUiThread {
+                answerView.announceForAccessibility(Spoken.VOICE_UNAVAILABLE)
+            }
+        }
+        val questionView: TextView = findViewById(R.id.question_text)
+        val chips: FlowLayout = findViewById(R.id.saw_chips)
+        Ui.styleAppName(findViewById(R.id.appname_text), "ANSWER")
 
         val record = HistoryStore.get(
             this, intent.getLongExtra(EXTRA_RECORD_ID, -1)
         )
         if (record == null || (record.answer == null && record.error == null)) {
-            statusView.text = getString(R.string.answer_missing)
-            return
-        }
-
-        if (record.error != null && record.answer == null) {
-            statusView.text = getString(R.string.answer_errored)
-            answerView.text = record.error
+            answerView.text = getString(R.string.answer_missing)
+            answer = getString(R.string.answer_missing)
+            errored = true
+        } else if (record.error != null && record.answer == null) {
+            // Detail view shows the code; the voice speaks plain words.
+            answerView.text = record.error +
+                record.errorDetail?.let { " ($it)" }.orEmpty()
             answer = record.error
             errored = true
         } else {
-            // The asked question, as the server heard it, above the answer.
-            val questionView: TextView = findViewById(R.id.question_text)
+            answer = record.answer.orEmpty()
+            escalated = record.behavior == "ESCALATE"
             if (record.question != null) {
                 questionView.text = record.question
             } else {
@@ -65,42 +70,57 @@ class AnswerActivity : AppCompatActivity() {
                     Spoken.youAsked(record.question)
                 else -> null
             }
-            answer = record.answer.orEmpty()
-            escalated = record.behavior == "ESCALATE"
-            statusView.text = if (escalated) {
-                getString(R.string.getting_help)
-            } else {
-                record.question?.let { "Q: $it" }
-                    ?: getString(R.string.answer_ready)
+
+            // Warnbox: Warning: lines display first; speech keeps order.
+            val lines = answer.split("\n")
+            val warnings = lines.filter {
+                it.trimStart().startsWith("Warning:")
             }
-            answerView.text = styledAnswer(answer)
-            val entries = HistoryStore.sceneEntries(record)
-            if (entries.isEmpty()) {
-                sawButton.visibility = View.GONE
-            } else {
-                for (e in entries) {
-                    val row = TextView(this).apply {
-                        text = "${e.name} — ${e.clock} o'clock"
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            val body = lines.filterNot {
+                it.trimStart().startsWith("Warning:")
+            }.joinToString("\n").trim()
+            if (warnings.isNotEmpty()) {
+                findViewById<LinearLayout>(R.id.warnbox).visibility =
+                    View.VISIBLE
+                findViewById<TextView>(R.id.warn_lines).text =
+                    warnings.joinToString("\n")
+            }
+            if (escalated) {
+                findViewById<LinearLayout>(R.id.helpbox).visibility =
+                    View.VISIBLE
+                findViewById<TextView>(R.id.help_quote).text =
+                    "\"" + Spoken.ESCALATE_LINE + "\""
+                answerView.text =
+                    getString(R.string.describe_prefix) + body.ifEmpty {
+                        answer
                     }
-                    sawList.addView(row)
-                }
+                answerView.setTextColor(Ui.dimColor(this))
+                findViewById<LinearLayout>(R.id.btnrow_normal).visibility =
+                    View.GONE
+                findViewById<LinearLayout>(R.id.btnrow_escalated).visibility =
+                    View.VISIBLE
+            } else {
+                answerView.text = body.ifEmpty { answer }
+            }
+
+            for (e in HistoryStore.sceneEntries(record)) {
+                chips.addView(chipFor(e))
             }
         }
 
-        sawButton.setOnClickListener {
-            val show = sawList.visibility != View.VISIBLE
-            sawList.visibility = if (show) View.VISIBLE else View.GONE
-            sawButton.text = getString(
-                if (show) R.string.what_i_saw_hide else R.string.what_i_saw_show
-            )
-            Haptics.pulse(this)
-        }
         findViewById<Button>(R.id.answer_replay_button).setOnClickListener {
             Haptics.pulse(this)
             replayAnswer()
         }
         findViewById<Button>(R.id.follow_up_button).setOnClickListener {
+            finish()
+        }
+        findViewById<Button>(R.id.keep_waiting_button).setOnClickListener {
+            // v1: no volunteer channel yet — confirm we're still here.
+            Haptics.pulse(this)
+            tts.speak(getString(R.string.help_waiting))
+        }
+        findViewById<Button>(R.id.leave_button).setOnClickListener {
             finish()
         }
 
@@ -113,10 +133,23 @@ class AnswerActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private fun chipFor(entry: SceneEntry): TextView {
+        val label = if (entry.sizeClass == "far") {
+            "${entry.name} · far, ${entry.clock} o'clock"
+        } else {
+            "${entry.name} · ${entry.clock} o'clock"
+        }
+        return TextView(this).apply {
+            text = label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(Ui.dimColor(this@AnswerActivity))
+            setBackgroundResource(R.drawable.chip)
+            val pad = (10 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad / 2, pad, pad / 2)
+        }
+    }
+
     private fun replayAnswer() {
-        // Spoken as written: warnings already lead in the backend's text.
-        // No silent fallback: the question preamble always precedes the
-        // answer (escalation line first when escalated).
         if (errored) {
             tts.speak(answer)
             return
@@ -132,33 +165,6 @@ class AnswerActivity : AppCompatActivity() {
         } else {
             tts.speak(answer)
         }
-    }
-
-    /** "Warning:" lines in the warning style, original order preserved. */
-    private fun styledAnswer(text: String): CharSequence {
-        val out = SpannableString(text)
-        val typed = TypedValue()
-        theme.resolveAttribute(R.attr.warningTextColor, typed, true)
-        val color = if (typed.resourceId != 0) {
-            getColor(typed.resourceId)
-        } else {
-            typed.data
-        }
-        var index = 0
-        for (line in text.split("\n")) {
-            if (line.trimStart().startsWith("Warning:")) {
-                out.setSpan(
-                    ForegroundColorSpan(color), index, index + line.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-                out.setSpan(
-                    StyleSpan(Typeface.BOLD), index, index + line.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-            }
-            index += line.length + 1
-        }
-        return out
     }
 
     companion object {

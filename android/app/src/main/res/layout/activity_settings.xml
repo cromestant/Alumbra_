@@ -8,13 +8,35 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="24dp">
+        android:padding="18dp">
+
+        <TextView
+            android:id="@+id/appname_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:letterSpacing="0.2"
+            android:text="SETTINGS"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="14sp"
+            android:textStyle="bold" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:letterSpacing="0.15"
+            android:text="@string/section_speaking"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
             android:text="@string/settings_language"
-            android:textSize="20sp" />
+            android:textColor="@color/alumbra_ink"
+            android:textSize="18sp" />
 
         <Spinner
             android:id="@+id/language_spinner"
@@ -26,9 +48,10 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="14dp"
             android:text="@string/settings_rate"
-            android:textSize="20sp" />
+            android:textColor="@color/alumbra_ink"
+            android:textSize="18sp" />
 
         <SeekBar
             android:id="@+id/rate_seekbar"
@@ -41,32 +64,72 @@
             android:id="@+id/rate_value"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textSize="18sp" />
+            android:textColor="@color/alumbra_amber"
+            android:textSize="16sp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/alumbra_line" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:letterSpacing="0.15"
+            android:text="@string/section_display"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="13sp"
+            android:textStyle="bold" />
 
         <androidx.appcompat.widget.SwitchCompat
             android:id="@+id/contrast_switch"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="10dp"
             android:contentDescription="@string/settings_contrast_description"
             android:text="@string/settings_contrast"
-            android:textSize="20sp" />
+            android:textColor="@color/alumbra_ink"
+            android:textSize="18sp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/alumbra_line" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="16dp"
+            android:letterSpacing="0.15"
+            android:text="@string/section_service"
+            android:textColor="@color/alumbra_dim"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
             android:text="@string/settings_server"
-            android:textSize="20sp" />
+            android:textColor="@color/alumbra_ink"
+            android:textSize="18sp" />
 
         <EditText
             android:id="@+id/base_url_field"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="@drawable/box_type"
             android:contentDescription="@string/settings_server_description"
             android:hint="@string/settings_server_hint"
             android:inputType="textUri"
-            android:textSize="18sp" />
+            android:padding="12dp"
+            android:textColor="@color/alumbra_ink"
+            android:textColorHint="@color/alumbra_dim"
+            android:textSize="16sp" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -81,7 +144,9 @@
                 android:layout_marginEnd="4dp"
                 android:layout_weight="1"
                 android:contentDescription="@string/preset_lan_description"
-                android:text="@string/preset_lan_label" />
+                android:minHeight="0dp"
+                android:text="@string/preset_lan_label"
+                style="@style/Widget.Alumbra.Button.Slim" />
 
             <Button
                 android:id="@+id/preset_tail_button"
@@ -90,7 +155,9 @@
                 android:layout_marginStart="4dp"
                 android:layout_weight="1"
                 android:contentDescription="@string/preset_tail_description"
-                android:text="@string/preset_tail_label" />
+                android:minHeight="0dp"
+                android:text="@string/preset_tail_label"
+                style="@style/Widget.Alumbra.Button.Slim" />
 
         </LinearLayout>
 
@@ -100,21 +167,26 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:contentDescription="@string/save_server_description"
-            android:text="@string/save_server_label" />
+            android:minHeight="56dp"
+            android:text="@string/save_server_label"
+            style="@style/Widget.Alumbra.Button.Primary" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="16dp"
             android:text="@string/settings_camera_tier"
-            android:textSize="20sp" />
+            android:textColor="@color/alumbra_ink"
+            android:textSize="18sp" />
 
         <TextView
             android:id="@+id/camera_tier_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
             android:layout_marginBottom="16dp"
-            android:textSize="18sp" />
+            android:textColor="@color/alumbra_amber"
+            android:textSize="16sp" />
 
     </LinearLayout>
 </ScrollView>

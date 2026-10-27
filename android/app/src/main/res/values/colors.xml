@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Palette from android-ui-mock.html (repo root, untracked reference). -->
+<resources>
+    <color name="alumbra_bg">#000000</color>
+    <color name="alumbra_panel">#101014</color>
+    <color name="alumbra_ink">#FFFFFF</color>
+    <color name="alumbra_dim">#B9BEC9</color>
+    <color name="alumbra_amber">#FFD23F</color>
+    <color name="alumbra_amber_ink">#161200</color>
+    <color name="alumbra_warn">#FF7847</color>
+    <color name="alumbra_warn_bg">#2A1206</color>
+    <color name="alumbra_help">#57C7FF</color>
+    <color name="alumbra_help_bg">#06202E</color>
+    <color name="alumbra_line">#2A2A33</color>
+    <color name="alumbra_soft_bg">#16161C</color>
+</resources>

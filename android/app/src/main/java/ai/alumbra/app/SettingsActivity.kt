@@ -19,6 +19,7 @@ class SettingsActivity : AppCompatActivity() {
         Prefs.applyTheme(this)
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
+        Ui.applyEdgeToEdge(this)
 
         val spinner: Spinner = findViewById(R.id.language_spinner)
         spinner.adapter = ArrayAdapter(
@@ -42,10 +43,15 @@ class SettingsActivity : AppCompatActivity() {
             override fun onNothingSelected(parent: AdapterView<*>) = Unit
         }
 
+        Ui.styleAppName(findViewById(R.id.appname_text), "SETTINGS")
         val rateValue: TextView = findViewById(R.id.rate_value)
         val seekbar: SeekBar = findViewById(R.id.rate_seekbar)
         fun showRate(progress: Int) {
-            rateValue.text = "%.2fx".format(0.5f + progress * 0.05f)
+            rateValue.text = if (progress == 10) {
+                getString(R.string.rate_normal)
+            } else {
+                "%.2fx".format(0.5f + progress * 0.05f)
+            }
         }
         seekbar.progress =
             ((Prefs.speechRate(this) - 0.5f) / 0.05f).toInt().coerceIn(0, 30)

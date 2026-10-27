@@ -30,9 +30,20 @@ object Spoken {
     const val GETTING_HELP = "Getting help."
     const val DIDNT_CATCH_QUESTION =
         "I didn't catch a question, so I described the scene."
+    const val VOICE_UNAVAILABLE = "Voice unavailable."
+    const val CAMERA_UNAVAILABLE = "Camera unavailable."
+    const val PHOTO_FAILED = "Photo failed. Try again."
+    const val CLIP_FAILED = "Clip failed. Try again."
+    const val RECORDING_FAILED = "Recording failed. Try again."
+    const val SERVER_UNREACHABLE = "Could not reach the server."
+    const val SERVER_ERROR = "The server had a problem."
+    const val BAD_RESPONSE = "Couldn't read the server's answer."
 
     fun youAsked(question: String): String = "You asked: $question"
     fun iHeard(transcript: String): String = "I heard: $transcript"
+    fun workingSub(clip: Boolean): String =
+        (if (clip) "Clip sent. " else "Photo sent. ") +
+            "This can take up to a minute — I'll speak as soon as I know."
     const val WHAT_I_SAW_SHOW = "What I saw. Show details."
     const val WHAT_I_SAW_HIDE = "What I saw. Hide details."
     const val ASK_LIVE_IDLE = "Hold the button to record a clip, or tap " +

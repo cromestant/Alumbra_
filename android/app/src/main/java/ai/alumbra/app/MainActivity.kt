@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
 import android.widget.Button
@@ -24,7 +25,6 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
@@ -33,7 +33,6 @@ import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
-import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.io.File
@@ -50,7 +49,6 @@ import java.io.FileOutputStream
  */
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
-    private lateinit var previewView: PreviewView
     private lateinit var recordButton: Button
     private lateinit var statusText: TextView
     private lateinit var typeField: EditText
@@ -59,6 +57,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var torchButton: Button
     private lateinit var workingOverlay: LinearLayout
     private lateinit var workingText: TextView
+    private lateinit var workingSub: TextView
+    private lateinit var pulseView: TextView
+    private var pulseAnim: android.animation.ObjectAnimator? = null
 
     private lateinit var tts: AlumbraTts
     private lateinit var api: AskApi
@@ -90,8 +91,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         Prefs.applyTheme(this)
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        Ui.applyEdgeToEdge(this)
 
-        previewView = findViewById(R.id.preview_view)
         recordButton = findViewById(R.id.record_button)
         statusText = findViewById(R.id.status_text)
         typeField = findViewById(R.id.type_field)
@@ -100,9 +101,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         torchButton = findViewById(R.id.torch_button)
         workingOverlay = findViewById(R.id.working_overlay)
         workingText = findViewById(R.id.working_text)
+        workingSub = findViewById(R.id.working_sub)
+        pulseView = findViewById(R.id.pulse_view)
         workingOverlay.isClickable = true
+        Ui.styleAppName(findViewById(R.id.appname_text))
+        styleAskButton()
 
         tts = AlumbraTts(this)
+        // Dead engine: announce() still sets the visible + live-region
+        // status text (TalkBack speaks it); the speak half no-ops.
+        tts.onVoiceUnavailable = {
+            runOnUiThread { announce(Spoken.VOICE_UNAVAILABLE) }
+        }
         api = AskApi(Prefs.baseUrl(this))
         sensorManager =
             getSystemService(SENSOR_SERVICE) as SensorManager
@@ -196,6 +206,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         recognizer?.destroy()
         api.cancel()
         tts.shutdown()
+        Earcons.release()
         super.onDestroy()
     }
 
@@ -307,12 +318,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // -- camera ----------------------------------------------------------
 
     private fun bindCamera() {
+        // No preview surface (mock look): capture-only binding.
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             try {
                 val provider = providerFuture.get()
-                val preview = Preview.Builder().build()
-                preview.setSurfaceProvider(previewView.surfaceProvider)
                 imageCapture = ImageCapture.Builder().build()
                 val recorder = Recorder.Builder()
                     .setQualitySelector(
@@ -326,12 +336,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 camera = provider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
                     imageCapture,
                     videoCapture,
                 )
             } catch (e: Exception) {
-                announce("Camera unavailable (${e.message}).")
+                Log.e("Alumbra", "bindCamera failed", e)
+                announce(Spoken.CAMERA_UNAVAILABLE)
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -395,13 +405,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     override fun onImageSaved(
                         output: ImageCapture.OutputFileResults
                     ) {
+                        // Mic goes hot for the listen window: cut any
+                        // in-flight utterance, confirm with haptic + cue.
+                        tts.stop()
+                        tts.micHot = true
                         Haptics.pulse(this@MainActivity)
-                        announce(Spoken.PHOTO_TAKEN)
+                        Earcons.shutter()
+                        statusOnly(Spoken.PHOTO_TAKEN)
                         listenThenSend(photoFile = file)
                     }
 
                     override fun onError(exc: ImageCaptureException) {
-                        announce("Photo failed (${exc.message}).")
+                        tts.micHot = false
+                        Log.e("Alumbra", "photo capture failed", exc)
+                        announce(Spoken.PHOTO_FAILED)
                     }
                 },
             )
@@ -417,6 +434,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             if (transcriptArrived) return@QuestionRecognizer
             transcriptArrived = true
             pendingTranscript = transcript
+            tts.micHot = false
             sendPhotoAsk(photoFile, transcript)
         }
         recognizer?.start()
@@ -437,7 +455,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         } else {
             ""
         }
-        showWorking(heard + Spoken.PHOTO_SENT)
+        showWorking(heard + Spoken.PHOTO_SENT, Spoken.workingSub(false))
         // No raw-audio file for photo asks: SpeechRecognizer owns the mic
         // during the window, and concurrent capture is unreliable.
         api.ask(photoFile, question, audio = null, media = null) {
@@ -454,6 +472,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         val video = videoCapture ?: return
         ensurePermissions {
+            // Cut any in-flight utterance before the mic opens.
+            tts.stop()
+            tts.micHot = true
             clipFile = File(cacheDir, "ask_${System.currentTimeMillis()}.mp4")
             clipFinalized = false
             clipError = null
@@ -476,6 +497,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     .start(ContextCompat.getMainExecutor(this)) { event ->
                         if (event is VideoRecordEvent.Finalize) {
                             if (event.hasError()) {
+                                // Technical text: History detail + log only.
+                                // The status line gets plain words below.
+                                Log.w(
+                                    "Alumbra",
+                                    "clip finalize error=${event.error}",
+                                )
                                 clipError = "Clip failed " +
                                     "(${event.error})."
                             }
@@ -484,7 +511,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         }
                     }
                 Haptics.pulse(this)
-                announce(Spoken.RECORDING_START)
+                Earcons.start()
+                statusOnly(Spoken.RECORDING_START)
                 recognizer = QuestionRecognizer(this) { transcript ->
                     transcriptArrived = true
                     pendingTranscript = transcript
@@ -493,20 +521,25 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 recognizer?.start()
             } catch (e: Exception) {
                 clipRecording = null
-                announce("Recording failed (${e.message}).")
+                tts.micHot = false
+                Log.e("Alumbra", "clip recording failed", e)
+                announce(Spoken.RECORDING_FAILED)
             }
         }
     }
 
     private fun finishClipAsk() {
-        Haptics.pulse(this)
         try {
             clipRecording?.stop()
         } catch (e: Exception) {
         }
         clipRecording = null
         recognizer?.stop()
-        showWorking(Spoken.CLIP_SENT)
+        // Mic closed: stop cue now, speech safe from here on.
+        tts.micHot = false
+        Haptics.pulse(this)
+        Earcons.stop()
+        showWorking(Spoken.CLIP_SENT, Spoken.workingSub(true))
         // maybeSendClipAsk fires when finalize + transcript both land.
         handler.postDelayed({
             if (sending) return@postDelayed
@@ -526,8 +559,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (error != null || file == null || !file.exists()) {
             hideWorking()
             sending = false
-            HistoryStore.add(this, null, null, error ?: "Empty clip.")
-            announce(error ?: "Empty clip.")
+            // History keeps the technical detail; the status line
+            // and voice get plain words, never the error code.
+            val plain = if (error != null) Spoken.CLIP_FAILED else "Empty clip."
+            HistoryStore.add(
+                this, null, null, plain, errorDetail = error
+            )
+            announce(plain)
             return
         }
         val typed = typeField.text.toString().trim()
@@ -580,14 +618,47 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // -- working + outcome ----------------------------------------------------
 
-    private fun showWorking(line: String) {
-        workingText.text = line
+    private fun showWorking(line: String, sub: String) {
+        workingText.text = getString(R.string.working_label)
+        workingSub.text = sub
         workingOverlay.visibility = LinearLayout.VISIBLE
+        pulseAnim?.cancel()
+        pulseAnim = Ui.pulse(pulseView)
         announce(line)
     }
 
     private fun hideWorking() {
+        pulseAnim?.cancel()
+        pulseAnim = null
+        pulseView.alpha = 1f
         workingOverlay.visibility = LinearLayout.GONE
+    }
+
+    private fun styleAskButton() {
+        val big = getString(R.string.record_button_big)
+        val small = getString(R.string.record_button_small)
+        val text = "$big\n$small"
+        val out = android.text.SpannableString(text)
+        out.setSpan(
+            android.text.style.AbsoluteSizeSpan(30, true), 0, big.length,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        out.setSpan(
+            android.text.style.StyleSpan(android.graphics.Typeface.BOLD),
+            0, big.length,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val smallStart = big.length + 1
+        out.setSpan(
+            android.text.style.AbsoluteSizeSpan(15, true), smallStart,
+            text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        out.setSpan(
+            android.text.style.ForegroundColorSpan(0xBF161200.toInt()),
+            smallStart, text.length,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        recordButton.text = out
     }
 
     private fun onAskOutcome(question: String?, outcome: AskOutcome) {
@@ -613,7 +684,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     )
                 }
                 is AskOutcome.Err -> {
-                    HistoryStore.add(this, question, null, outcome.message)
+                    // History keeps the technical detail; the status
+                    // line and voice get plain words only.
+                    HistoryStore.add(
+                        this, question, null, outcome.message,
+                        errorDetail = outcome.detail,
+                    )
                     announce(Spoken.errorDetail(outcome.message))
                 }
             }
@@ -624,14 +700,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val record = HistoryStore.list(this).firstOrNull {
             it.answer != null
         }
-        lastAnswer = record?.answer
-        lastAnswerText.text = record?.answer?.take(LAST_ANSWER_CHARS)
-            ?.let { "Last answer: $it…" } ?: getString(R.string.no_answer_yet)
+        val full = record?.answer
+        lastAnswer = full
+        lastAnswerText.text = when {
+            full == null -> getString(R.string.no_answer_yet)
+            full.length > LAST_ANSWER_CHARS ->
+                full.take(LAST_ANSWER_CHARS) + "…"
+            else -> full
+        }
     }
 
     private fun announce(line: String) {
         statusText.text = line
         tts.speak(line)
+    }
+
+    /** Live-region status without app voice (used while the mic is hot). */
+    private fun statusOnly(line: String) {
+        statusText.text = line
     }
 
     companion object {
