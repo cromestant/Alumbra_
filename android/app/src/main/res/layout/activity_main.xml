@@ -19,6 +19,45 @@
             android:textSize="14sp"
             android:textStyle="bold" />
 
+        <!-- Follow-up mode banner: which ask this follows, and the way
+             out to a fresh ask. Hidden on a plain Ask screen. -->
+        <LinearLayout
+            android:id="@+id/followup_panel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/panel"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/followup_on_label"
+                android:textColor="@color/alumbra_dim"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/followup_question_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/alumbra_ink"
+                android:textSize="18sp" />
+
+            <Button
+                android:id="@+id/followup_exit_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:contentDescription="@string/new_question_description"
+                android:minHeight="56dp"
+                android:text="@string/new_question_label"
+                style="@style/Widget.Alumbra.Button.Outline" />
+
+        </LinearLayout>
+
         <Button
             android:id="@+id/record_button"
             android:layout_width="match_parent"

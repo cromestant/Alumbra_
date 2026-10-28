@@ -20,6 +20,18 @@
             android:textSize="14sp"
             android:textStyle="bold" />
 
+        <!-- Way back to the Ask screen: first control after the title,
+             so it is reachable without scrolling past a long answer. -->
+        <Button
+            android:id="@+id/new_question_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:contentDescription="@string/new_question_description"
+            android:minHeight="56dp"
+            android:text="@string/new_question_label"
+            style="@style/Widget.Alumbra.Button.Outline" />
+
         <LinearLayout
             android:id="@+id/helpbox"
             android:layout_width="match_parent"

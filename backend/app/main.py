@@ -16,10 +16,23 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from .pipeline import FollowupExpired, PipelineError, run_ask, run_followup
+from . import capture
+from .pipeline import (
+    FollowupExpired, PipelineError, StageFailed, run_ask, run_followup,
+)
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/3gpp", "video/webm"}
+# Failure rule (2026-10-27): a stage that did not run errors the ask
+# (503) with a line the app speaks as-is; the user retries.
+TRY_AGAIN = "Something went wrong — please try again."
+
+
+def _stage_failed(e: StageFailed) -> HTTPException:
+    return HTTPException(status_code=503, detail={
+        "error": "stage_failed", "stage": e.stage,
+        "message": TRY_AGAIN, "cause": str(e),
+    })
 
 
 def create_app() -> FastAPI:
@@ -82,12 +95,25 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="empty image upload")
         media_bytes = await media.read() if media and media.filename else None
         audio_bytes = await audio.read() if audio and audio.filename else None
+        cap = capture.begin("ask", question or "", data, media_bytes,
+                            audio_bytes)
+        trace: dict = {}
         try:
             result = await asyncio.to_thread(
-                run_ask, data, question or "", media_bytes, audio_bytes
+                run_ask, data, question or "", media_bytes, audio_bytes,
+                trace,
             )
+        except StageFailed as e:
+            err = _stage_failed(e)
+            capture.fail(cap, err.status_code, err.detail)
+            raise err
         except PipelineError as e:
+            capture.fail(cap, 502, str(e))
             raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            capture.fail(cap, 500, repr(e))
+            raise
+        capture.finish(cap, result, trace)
         return JSONResponse(content=result)
 
     @app.post("/followup")
@@ -104,14 +130,29 @@ def create_app() -> FastAPI:
         says so plainly and offers a fresh ask.
         """
         audio_bytes = await audio.read() if audio and audio.filename else None
+        # The photo/clip live in the parent ask's capture.
+        cap = capture.begin("followup", question or "", audio=audio_bytes,
+                            parent_ask_id=ask_id)
+        trace: dict = {}
         try:
             result = await asyncio.to_thread(
-                run_followup, ask_id or "", question or "", audio_bytes
+                run_followup, ask_id or "", question or "", audio_bytes,
+                trace,
             )
         except FollowupExpired as e:
+            capture.fail(cap, 410, str(e))
             raise HTTPException(status_code=410, detail=str(e))
+        except StageFailed as e:
+            err = _stage_failed(e)
+            capture.fail(cap, err.status_code, err.detail)
+            raise err
         except PipelineError as e:
+            capture.fail(cap, 502, str(e))
             raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            capture.fail(cap, 500, repr(e))
+            raise
+        capture.finish(cap, result, trace)
         return JSONResponse(content=result)
 
     return app

@@ -8,14 +8,20 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 
 /**
  * Answer screen (mock look): warnbox extracts "Warning:" lines above the
  * answer, grounding renders as always-visible chips, and ESCALATE swaps
- * in the helpbox + Keep-waiting/Leave row. Speech order is unchanged:
- * warnings spoken as written, escalation line first, then the question
- * preamble, then the answer.
+ * in the helpbox + Keep-waiting/Leave row. Spoken script: escalation
+ * line first (when escalated), then the answer, warnings as written.
+ * The question is never echoed aloud — it is shown on screen and kept
+ * in History. Only "I didn't catch a question" is spoken ahead of the
+ * answer, because it carries information the answer does not.
+ *
+ * "New question" (and system Back after a fresh or follow-up ask)
+ * returns to the Ask screen; opened from History, Back returns there.
  */
 class AnswerActivity : AppCompatActivity() {
 
@@ -65,12 +71,10 @@ class AnswerActivity : AppCompatActivity() {
             } else {
                 questionView.visibility = View.GONE
             }
-            preamble = when {
-                record.questionSource == "none" ->
-                    Spoken.DIDNT_CATCH_QUESTION
-                record.question != null ->
-                    Spoken.youAsked(record.question)
-                else -> null
+            preamble = if (record.questionSource == "none") {
+                Spoken.DIDNT_CATCH_QUESTION
+            } else {
+                null
             }
 
             // Warnbox: Warning: lines display first; speech keeps order.
@@ -110,6 +114,21 @@ class AnswerActivity : AppCompatActivity() {
             }
         }
 
+        findViewById<Button>(R.id.new_question_button).setOnClickListener {
+            Haptics.pulse(this)
+            goToAsk()
+        }
+        // Back after a fresh or follow-up ask lands on Ask (never on a
+        // stale follow-up screen); from History it returns to History.
+        val fromHistory = intent.getBooleanExtra(EXTRA_FROM_HISTORY, false)
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (fromHistory) finish() else goToAsk()
+                }
+            },
+        )
         findViewById<Button>(R.id.answer_replay_button).setOnClickListener {
             Haptics.pulse(this)
             replayAnswer()
@@ -125,9 +144,12 @@ class AnswerActivity : AppCompatActivity() {
                     .show()
             } else {
                 startActivity(
-                    Intent(this, MainActivity::class.java).putExtra(
-                        MainActivity.EXTRA_FOLLOWUP_ASK_ID, askId
-                    )
+                    Intent(this, MainActivity::class.java)
+                        .putExtra(MainActivity.EXTRA_FOLLOWUP_ASK_ID, askId)
+                        .putExtra(
+                            MainActivity.EXTRA_FOLLOWUP_QUESTION,
+                            record.question,
+                        )
                 )
             }
         }
@@ -137,7 +159,7 @@ class AnswerActivity : AppCompatActivity() {
             tts.speak(getString(R.string.help_waiting))
         }
         findViewById<Button>(R.id.leave_button).setOnClickListener {
-            finish()
+            goToAsk()
         }
 
         Haptics.pulse(this)
@@ -147,6 +169,18 @@ class AnswerActivity : AppCompatActivity() {
     override fun onDestroy() {
         tts.shutdown()
         super.onDestroy()
+    }
+
+    /** Back to the root Ask screen, clearing answers above it. */
+    private fun goToAsk() {
+        tts.stop()
+        startActivity(
+            Intent(this, MainActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+        )
+        finish()
     }
 
     private fun chipFor(entry: SceneEntry): TextView {
@@ -185,5 +219,6 @@ class AnswerActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_RECORD_ID = "record_id"
+        const val EXTRA_FROM_HISTORY = "from_history"
     }
 }

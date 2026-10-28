@@ -4,8 +4,20 @@
     <string name="record_button_label">Hold to record, tap for photo</string>
     <string name="record_button_big">Tap to ask\nabout a photo</string>
     <string name="record_button_small">Press and hold to record a clip\nwhile you talk</string>
-    <string name="followup_button_big">Tap to speak\nyour follow-up</string>
-    <string name="followup_button_small">Or type below, then tap to send</string>
+    <string name="followup_button_big">Hold and talk\nto ask your follow-up</string>
+    <string name="followup_button_small">Or tap, then speak · or type below and tap</string>
+    <!-- Mic live (hold): shown for the whole capture. -->
+    <string name="recording_button_big">Recording…</string>
+    <string name="recording_button_small">Release to send</string>
+    <string name="recording_button_description">Recording. Release to send.</string>
+    <!-- Mic live (tap): the timed listen window. -->
+    <string name="listening_button_big">Listening…</string>
+    <string name="listening_button_small">Speak your question now</string>
+    <string name="listening_button_description">Listening. Speak your question now.</string>
+    <string name="followup_button_description">Follow-up button. Hold and talk to ask your follow-up question, or tap and then speak.</string>
+    <string name="followup_on_label">Follow-up on:</string>
+    <string name="new_question_label">◀ New question</string>
+    <string name="new_question_description">New question. Go back to the Ask screen.</string>
     <string name="last_answer_label">Last answer</string>
     <string name="working_sub">Sent. This can take up to a minute — I\'ll speak as soon as I know.</string>
     <string name="replay_pill_label">▶ Replay</string>
@@ -15,7 +27,7 @@
     <string name="keep_waiting_label">Keep waiting</string>
     <string name="keep_waiting_description">Keep waiting for a volunteer</string>
     <string name="leave_label">Leave the question</string>
-    <string name="leave_description">Leave this question and go back</string>
+    <string name="leave_description">Leave this question and go back to the Ask screen</string>
     <string name="record_button_description">Ask button. Tap for a photo question, press and hold to record a video clip question.</string>
     <string name="status_description">Status</string>
     <string name="status_idle">Hold the button to record a clip, or tap it for a photo question.</string>

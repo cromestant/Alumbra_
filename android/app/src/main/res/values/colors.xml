@@ -13,4 +13,7 @@
     <color name="alumbra_help_bg">#06202E</color>
     <color name="alumbra_line">#2A2A33</color>
     <color name="alumbra_soft_bg">#16161C</color>
+    <!-- Mic live: the big button turns red for the whole capture. -->
+    <color name="alumbra_rec">#D7263D</color>
+    <color name="alumbra_rec_ink">#FFFFFF</color>
 </resources>

@@ -31,8 +31,10 @@ object Spoken {
     const val DIDNT_CATCH_QUESTION =
         "I didn't catch a question, so I described the scene."
     const val VOICE_UNAVAILABLE = "Voice unavailable."
-    const val FOLLOWUP_IDLE =
-        "Follow-up. Speak or type your question about the last answer."
+    // Follow-up mode, announced on entry and shown in the banner.
+    fun followupIntro(prior: String?): String =
+        if (prior.isNullOrBlank()) "Follow-up. Hold and talk to ask."
+        else "Follow-up on: $prior. Hold and talk to ask."
     const val FOLLOWUP_LISTENING = "Listening for your follow-up question."
     const val FOLLOWUP_SENT = "Follow-up sent, analyzing."
     const val FOLLOWUP_NONE = "Say or type your follow-up question first."
@@ -48,10 +50,14 @@ object Spoken {
     const val RECORDING_FAILED = "Recording failed. Try again."
     const val SERVER_UNREACHABLE = "Could not reach the server."
     const val SERVER_ERROR = "The server had a problem."
+    // A pipeline stage failed after its retry (HTTP 503) or the model
+    // API was unreachable (502): spoken as-is, no "Sorry" wrap.
+    const val TRY_AGAIN = "Something went wrong — please try again."
+    const val BACK_TO_ASK =
+        "New question. Hold the button to record a clip, or tap it " +
+            "for a photo question."
     const val BAD_RESPONSE = "Couldn't read the server's answer."
 
-    fun youAsked(question: String): String = "You asked: $question"
-    fun iHeard(transcript: String): String = "I heard: $transcript"
     fun workingSub(clip: Boolean): String =
         (if (clip) "Clip sent. " else "Photo sent. ") +
             "This can take up to a minute — I'll speak as soon as I know."

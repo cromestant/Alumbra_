@@ -34,6 +34,8 @@ class HistoryActivity : AppCompatActivity() {
             startActivity(
                 Intent(this, AnswerActivity::class.java).putExtra(
                     AnswerActivity.EXTRA_RECORD_ID, records[position].id
+                ).putExtra(
+                    AnswerActivity.EXTRA_FROM_HISTORY, true
                 )
             )
         }

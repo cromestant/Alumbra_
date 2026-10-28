@@ -45,12 +45,14 @@ sealed interface AskOutcome {
      * message is plain words for the status line + voice; detail carries
      * the technical cause for History and logs, never spoken or shown.
      * expired marks a gone follow-up target (HTTP 410): the app says so
-     * plainly and offers a fresh ask instead of retrying.
+     * plainly and offers a fresh ask instead of retrying. plain marks a
+     * message spoken as-is (no "Sorry, something went wrong." wrap).
      */
     data class Err(
         val message: String,
         val detail: String? = null,
         val expired: Boolean = false,
+        val plain: Boolean = false,
     ) : AskOutcome
 }
 
@@ -183,6 +185,17 @@ class AskApi(baseUrl: String) {
                                     Spoken.ASK_EXPIRED,
                                     "HTTP 410",
                                     expired = true,
+                                )
+                            )
+                        } else if (it.code == 503 || it.code == 502) {
+                            // Failure rule: a stage did not run (503) or
+                            // the model API was down (502). Retry-able.
+                            callback(
+                                AskOutcome.Err(
+                                    Spoken.TRY_AGAIN,
+                                    "HTTP ${it.code}: " +
+                                        it.body?.string().orEmpty().take(300),
+                                    plain = true,
                                 )
                             )
                         } else {

@@ -7,7 +7,7 @@ crop_read.py) into one module behind POST /ask.
 Flows (brief 2026-10-26):
   A — open scene: Spark names nouns, SAM grounds each + the safety list.
   B — named target: SAM the target phrase + the safety list.
-  C — labeled item: SAM category boxes, crop each, Wonder reads labels.
+  C — labeled item: SAM category boxes, crop each, Spark reads labels.
 
 Only stdlib + requests + Pillow. No numpy, no meta-sam-parser (the parser
 returned 0 records on the raw lane; the wire-format regex below is the
@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 
 # ----------------------------------------------------------------------------
 # Config
@@ -42,8 +42,14 @@ from PIL import Image
 API_BASE = os.environ.get("META_MODEL_API_BASE", "https://api.meta.ai/v1")
 ENDPOINT = f"{API_BASE.rstrip('/')}/responses"
 SAM_MODEL = "sam-3.1"
-SPARK_MODEL = "muse-spark-1.3"
-WONDER_MODEL = "muse-wonder-1.0"
+# Steering 2026-10-27: every Spark workload (naming, answer composition,
+# crop reads) and synthesis run on the contributor tier for cost. That
+# tier TRAINS ON INPUTS (photos included); Charles consented for his test
+# data for this event only. SPARK_MODEL=muse-spark-1.3 reverts. Wonder
+# (frontier agent model, $4/$20 per M, 20-28 s first byte) is no longer
+# used. SAM and ASR have no contributor tier and are unchanged.
+SPARK_MODEL = os.environ.get("SPARK_MODEL", "muse-spark-1.3-contributor")
+CROP_READ_MODEL = SPARK_MODEL
 
 # Tested winner (simple_test.py / dusk_rerun.py). Do not "improve".
 SPARK_NAMING_PROMPT = (
@@ -61,7 +67,7 @@ FLOW_C_CROP_CAP = 24
 FLOW_C_IOU = 0.7
 SAM_TIMEOUT = 180
 SPARK_TIMEOUT = 120
-WONDER_TIMEOUT = 60
+READ_TIMEOUT = 60
 FANOUT_WORKERS = 5
 
 HAZARD_KEYWORDS = ("puddle", "wet patch", "manhole", "stairs")
@@ -180,14 +186,23 @@ GOAL_ALIASES = {
     "hallway": ["hallway", "corridor"],
     "corridor": ["corridor", "hallway"],
 }
-SURFACE_WORDS = {"floor", "ground", "wall", "ceiling", "sky"}
+# Wall trim is the wall: a baseboard at the corridor's far end is not
+# an obstruction (passage geometry reaches it; the clock band did not).
+SURFACE_WORDS = {"floor", "ground", "wall", "ceiling", "sky",
+                 "baseboard", "baseboards", "skirting", "molding",
+                 "moulding"}
 SIZE_RANK = {"close": 0, "a few steps away": 1, "far": 2}
 
-# Answer tightening — duplicate scene instances (same object re-segmented
-# under overlapping phrases) collapse before answering. IoU gate: same
-# normalized name + overlapping boxes = same object; disjoint boxes with
-# the same name are distinct instances and are kept (mailbox banks).
-MERGE_IOU = 0.5
+# Answer tightening — segmentation echoes (the same object returned
+# again, under the same or another phrase with the same head noun)
+# collapse before answering. Only near-duplicate boxes are echoes:
+# IoU >= MERGE_IOU, or the smaller box almost wholly inside the larger
+# at a near-equal size. Distinct instances whose boxes merely overlap
+# (cats curled together, adjacent mailbox banks) stay separate entries —
+# counting reads the scene (live test 2026-10-27).
+MERGE_IOU = 0.8
+MERGE_CONTAIN = 0.9
+MERGE_AREA_RATIO = 0.7
 
 # Answer tightening — exit phrasing ("get out of the room") with no named
 # goal infers a door/exit goal when one is visible. Never produces
@@ -204,6 +219,72 @@ PASSABLE_WORDS = {
     "door", "doorway", "exit", "entrance", "entry", "hallway",
     "corridor", "hall", "sidewalk", "path", "road", "ramp",
 }
+
+# Rebuild 2026-10-27 — ground cover is what you walk on, never an
+# obstruction (table walk: "Careful — patio is in your path"). Exact
+# words, so "mattress" is not "mat" and "grassy" needs its own entry.
+GROUND_WORDS = {
+    "floor", "ground", "tile", "tiles", "tiled", "rug", "carpet",
+    "lawn", "grass", "grassy", "verge", "turf", "sidewalk", "pavement",
+    "paved", "path", "pathway", "footpath", "walkway", "patio", "deck",
+    "driveway", "terrace", "concrete", "asphalt", "gravel", "dirt",
+    "soil", "mulch", "sand", "field", "yard", "straw",
+}
+# A ground mention earns its place only when it matters for footing.
+FOOTING_RE = re.compile(
+    # "a few steps away" is a distance, not a step: only a step up/down,
+    # "a step", or "watch your step" is footing.
+    r"\b(wet|slippery|slick|icy|ice|uneven|cracked|cracks?|loose|bumpy|"
+    r"stairs?|curbs?|kerbs?|edges?|drop|slopes?|sloped|ramps?|"
+    r"transition|changes?|footing|trip|puddles?|mud|muddy)\b|"
+    r"\bsteps?\s+(?:up|down)\b|\ba\s+step\b|\bwatch\s+your\s+step\b",
+    re.IGNORECASE,
+)
+# Questions about the ground itself ("what am I stepping on?"): the
+# surface is the answer, not a route verdict.
+SURFACE_Q_RE = re.compile(
+    r"\bstep(?:ping)?\s+on\b|\bstanding\s+on\b|\bwalking\s+on\b|"
+    r"\bunder\s?foot\b|\bwhat(?:'s| is) the (?:ground|floor|surface)\b",
+    re.IGNORECASE,
+)
+# Rule 3 — distance questions lead with the distance.
+DISTANCE_RE = re.compile(
+    r"\bhow\s+(?:far|close|near)\b|"
+    r"\bhow\s+many\s+(?:steps|feet|meters|metres|yards)\b",
+    re.IGNORECASE,
+)
+DISTANCE_TO_RE = re.compile(
+    r"\bhow\s+(?:far|close|near)\b.*?\bto\s+(?:the|my|a|an)?\s*"
+    r"([a-z][a-z' ]+?)(?:\?|$|,|\.|!)", re.IGNORECASE,
+)
+DISTANCE_SUBJECT_RE = re.compile(
+    r"\bhow\s+(?:far|close|near)\s+(?:away\s+)?(?:is|are|'s)\s+"
+    r"(?:the|my|a|an)?\s*([a-z][a-z' ]+?)(?:\?|$|,|\.|!)", re.IGNORECASE,
+)
+DISTANCE_TAIL_WORDS = {"away", "from", "me", "now", "here", "there"}
+# A pronoun in the goal slot ("how far are they", "path to it") names
+# the prior referent — the follow-up's subject.
+PRONOUN_WORDS = {"it", "they", "them", "those", "these"}
+DIST_PHRASE = {"close": "close", "a few steps away": "a few steps away",
+               "far": "far away"}
+# A sentence that re-locates a known object at a known clock adds
+# nothing; one that relates it to something else adds a fact.
+RELATION_RE = re.compile(
+    r"\b(beside|below|above|under|underneath|next to|between|behind|"
+    r"on top of|on the|in the|near|left of|right of|against|inside)\b",
+    re.IGNORECASE,
+)
+PRONOUN_LEAD_RE = re.compile(
+    r"^(?:it|they|these|those)(?:'s|'re|\s)", re.IGNORECASE)
+# Trailing position words are not head nouns ("patio ahead" is a patio).
+POSITION_TAIL_WORDS = {
+    "ahead", "nearby", "behind", "overhead", "beyond", "below", "above",
+    "outside", "inside",
+}
+# Code-written openings (navigation/distance) leave Spark at most this
+# many body sentences, and at most one orientation landmark.
+BODY_MAX_SENTENCES = 2
+ORIENTATION_MAX = 1
 
 # Field test — the goal is whatever the question asks to reach: "path to
 # the X" / "get to X" / "reach X" names X the goal (fridge, couch,
@@ -304,6 +385,30 @@ GOAL_PART_WORDS = {
 FLOOR_LINE_NEAR = 0.55
 FLOOR_LINE_FAR = 0.4
 
+# Live test 2026-10-28 — the route is tested against the PASSAGE, not the
+# goal's clock. The corridor runs from the user's feet (frame bottom,
+# CORRIDOR_NEAR of the width) to the passage's base: for a door, the
+# opening you walk through — never the door leaf, which stands beside
+# it. A floor object whose footprint (box base) is inside the corridor,
+# or that lies in the opening itself, is on the route whatever its clock
+# ("cat lying in the doorway at 10 o'clock" cleared while wall-side
+# guitars at the leaf's clock were flagged).
+CORRIDOR_NEAR = (0.3, 0.7)
+# No goal: straight ahead to the far end of the frame (the old +-1 hour
+# band around 12 o'clock).
+CORRIDOR_AHEAD = (0.36, 0.64)
+PASSAGE_TOL = 0.03          # of image height: just past the base counts
+PASSAGE_BAND = 0.25         # lower part of the opening: lying in it
+# The overlap must be this much of the narrower of footprint and corridor:
+# a box edge grazing it (a chair arm at the frame edge) is beside you,
+# while a small thing (an ice cube) wholly inside is on the route.
+CORRIDOR_MIN_OVERLAP = 0.1
+DOOR_GOAL_WORDS = {"door", "doors", "doorway", "exit", "entrance",
+                   "entry", "gate"}
+OPENING_WORDS = {"doorway", "hallway", "corridor", "opening", "entrance",
+                 "entryway", "hall"}
+OPENING_PHRASE = "open doorway"
+
 
 def _image_height(image: bytes) -> int:
     try:
@@ -329,7 +434,7 @@ def _stands_on_floor(entry: dict[str, Any], height: int) -> bool:
 
 # Field test §1 — floor second look for navigation asks. Small,
 # low-contrast floor hazards (ice, spills, cords) escape the naming
-# pass, so SAM proposes directly over floor regions and Wonder reads
+# pass, so SAM proposes directly over floor regions and Spark reads
 # each proposal (the cabinet pattern). Navigation asks only; skipped
 # in the dark (nothing to see) and by FLOOR_LOOK_ENABLED=0.
 FLOOR_PHRASE = "small object on the floor"
@@ -456,7 +561,72 @@ ABSENCE_RES = [
         r"\bno (cars|vehicles|traffic) (are|in|visible)\b",
     )
 ]
-HOW_MANY_RE = re.compile(r"\bhow many\b", re.IGNORECASE)
+# Counting (live test 2026-10-27): a count is the number of scene
+# instances, decided in code — never the model's own tally. The subject
+# is the noun phrase after "how many" / "count the", cut at the verb.
+COUNT_RE = re.compile(
+    r"\b(?:how\s+many|count\s+(?:all\s+)?(?:the|my|of\s+the))\s+(.+)",
+    re.IGNORECASE,
+)
+COUNT_STOP_WORDS = {
+    "are", "is", "do", "does", "did", "can", "could", "were", "was",
+    "there", "here", "in", "on", "at", "near", "around", "by", "under",
+    "you", "i", "we", "have", "has", "that", "which", "to", "from",
+    "of", "with", "left", "right", "visible", "total", "altogether",
+    "please", "for", "me", "now", "should", "would", "will", "must",
+    "need",
+}
+# Group nouns: "mailbox banks" are counted as the scene's mailbox units
+# when no entry is named for the group noun itself.
+COUNT_GROUP_NOUNS = {"bank", "row", "stack", "pile", "group", "cluster",
+                     "set", "bunch", "column"}
+IRREGULAR_SINGULAR = {"people": "person", "children": "child",
+                      "men": "man", "women": "woman", "mice": "mouse",
+                      "geese": "goose", "feet": "foot", "teeth": "tooth"}
+# Plural-only nouns keep their s: eyeglasses are not drinking glasses.
+PLURAL_ONLY = {"glasses", "pants", "scissors", "jeans", "shorts",
+               "trousers", "binoculars", "headphones", "earbuds"}
+NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six",
+                "seven", "eight", "nine", "ten", "eleven", "twelve"]
+ORDINAL_WORDS = ["", "first", "second", "third", "fourth", "fifth",
+                 "sixth", "seventh", "eighth", "ninth", "tenth",
+                 "eleventh", "twelfth"]
+# A box this close to the frame border, and this much smaller than the
+# group's largest, is an instance cut off by the frame.
+EDGE_PX = 3
+PARTIAL_AREA_RATIO = 0.6
+COUNT_LIST_MAX = 6  # beyond this the lead gives a span, not every clock
+
+# Live test 2026-10-28 — a count over a clip is the union of the asked
+# class's instances across frames: a dark cat flat in a shadowed doorway
+# was missing from the single sent frame. The clip is scanned densely
+# and locally (no model calls): consecutive scan frames always overlap,
+# so the camera's pan links the whole sweep (thumbnail search,
+# translation only). Key frames are cut where the view has moved
+# CLIP_KEY_SHIFT of a frame since the last one, sharpest frame per view
+# — SAM runs on key frames only, so cost follows how much was filmed,
+# not how long. Boxes are mapped into the sent photo's coordinates and
+# clustered across frames; never within one (two cats in one frame are
+# two cats). Second live test: 6 evenly spaced frames could not link a
+# fast turn (chairs -> desk -> window), dropping the cat on the sill.
+CLIP_SCAN_FPS = 8
+CLIP_SCAN_MAX = 64     # scan frames (local only)
+CLIP_KEY_SHIFT = 0.6   # of a frame: a new view, a new key frame
+CLIP_KEY_MAX = 8       # SAM calls per clip, at most
+CLIP_ANCHOR_SPAN = 6   # scan frames either side of the middle tried
+# More unlinked segments than this: the sweep is not a sweep (shake,
+# blank wall) — count the best single key frame instead of summing.
+CLIP_MAX_SEGMENTS = 3
+CLIP_MATCH_IOU = 0.3
+# A frame edge cuts an instance to a sliver: the sliver lies inside the
+# full view's box from another frame, so containment matches too.
+CLIP_MATCH_CONTAIN = 0.6
+REG_THUMB_W = 64
+REG_MAX_DX = 0.6      # of width: search range for the pan
+REG_MAX_DY = 0.3      # of height
+REG_MIN_OVERLAP = 0.3  # of the thumbnail area
+REG_MAX_RATIO = 0.6   # best diff / median diff: below this, a real match
+SHARP_W = 160         # sharpness (edge energy) is measured at this width
 
 QUALIFIER_RE = re.compile(
     r"^(?P<base>.+?)\s+(?P<qual>(?:number\s+\d+|\d+\s*(?:st|nd|rd|th)?|"
@@ -477,10 +647,13 @@ _CLAUSE_CUT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Answer tightening — final synthesis pass (subtractive only, Wonder
-# class, hard timeout; on any failure the composed answer ships).
-SYNTHESIS_TIMEOUT = 3
-SYNTHESIS_MODEL = WONDER_MODEL
+# Answer tightening — final synthesis pass (subtractive only). The old
+# 3 s budget could never succeed (Wonder first byte 20-28 s, measured
+# 2026-10-27), so the draft always shipped. Budget is per read gap;
+# contributor-tier Spark measured 11-46 s for a full rewrite. Baseten
+# Llama is the planned fallback once approved.
+SYNTHESIS_TIMEOUT = 60
+SYNTHESIS_MODEL = SPARK_MODEL
 CLOCK_LIST_RE = re.compile(
     r"((?:\b\d{1,2}\b(?:\s*,)?\s*(?:and\s+)?)+)\s*o'clock",
     re.IGNORECASE,
@@ -502,6 +675,43 @@ SYNTHESIS_STOPWORDS = {
 
 class PipelineError(RuntimeError):
     """Upstream Model API failure the route reports as 502."""
+
+
+class StageFailed(PipelineError):
+    """A pipeline stage did not run, even after its retry (route: 503).
+
+    Failure rule (Charles, 2026-10-27): a stage that does not run errors
+    the ask and the user retries — a degraded answer is never shipped as
+    if nothing happened. A stage switched off by its kill switch is a
+    configuration, not a failure, and never raises this.
+    """
+
+    def __init__(self, stage: str, cause: BaseException | None):
+        self.stage = stage
+        super().__init__(f"stage {stage} failed after retry: "
+                         f"{type(cause).__name__}: {str(cause)[:200]}")
+
+
+class _BadOutput(RuntimeError):
+    """A model call returned, but nothing usable (counts as a failure)."""
+
+
+STAGE_ATTEMPTS = 2  # one bounded retry, each attempt with a fresh budget
+
+
+def _run_stage(stage: str, attempt: Any) -> Any:
+    """Run attempt() up to STAGE_ATTEMPTS times; StageFailed after that.
+
+    Every model-backed stage goes through here, so "retry once, then
+    error" is stated once instead of per call site.
+    """
+    last: BaseException | None = None
+    for _ in range(STAGE_ATTEMPTS):
+        try:
+            return attempt()
+        except Exception as e:
+            last = e
+    raise StageFailed(stage, last)
 
 
 def _load_secret(name: str) -> str:
@@ -560,6 +770,15 @@ def _stream_output_text(body: dict, timeout: int) -> str:
         raise PipelineError(
             f"Model API HTTP {resp.status_code}: {resp.text[:300]}"
         )
+    try:
+        return _read_stream(resp)
+    except requests.RequestException as e:
+        # Mid-stream read timeouts surface here (not at post()); they
+        # escaped as raw ConnectionError -> HTTP 500 before.
+        raise PipelineError(f"Model API stream broke: {e}") from e
+
+
+def _read_stream(resp: requests.Response) -> str:
     deltas: list[str] = []
     final_text: str | None = None
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -672,14 +891,14 @@ def sam_segment(image: bytes, phrase: str) -> list[dict[str, Any]]:
 
 
 def sam_many(image: bytes, phrases: list[str]) -> dict[str, list[dict]]:
-    """SAM several phrases concurrently; failed phrases map to []."""
+    """SAM several phrases concurrently. A phrase that fails its retry
+    fails the ask (StageFailed) — zero records is an answer, an error is
+    not, and a missing phrase is a hole in the scene nobody hears about."""
     out: dict[str, list[dict]] = {}
 
     def one(phrase: str) -> tuple[str, list[dict]]:
-        try:
-            return phrase, sam_segment(image, phrase)
-        except Exception:
-            return phrase, []
+        return phrase, _run_stage(
+            "segmentation", lambda: sam_segment(image, phrase))
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=FANOUT_WORKERS
@@ -707,168 +926,293 @@ def is_navigation_question(question: str) -> bool:
     return bool(NAVIGATION_RE.search(question or ""))
 
 
-def _path_assessment(
-    scene: list[dict[str, Any]], question: str, height: int = 0
-) -> dict[str, Any]:
-    """Part B: facts about the route, computed — not free-reasoned.
+def _has_word(name: str, words: set[str]) -> bool:
+    return any(re.search(r"\b" + re.escape(w) + r"\b", name) for w in words)
 
-    Goal: the object the question asks to reach — a named goal word,
-    a "path/way to the X" reach target, then a visible door/exit when
-    the question phrases leaving; else straight ahead (12 o'clock). The
-    goal is never an obstruction, whatever it is. On-path:
-    floor-standing entries within +-1 hour of the goal's clock and no
-    farther than the goal (near objects count when the goal is close) —
-    never the goal or its duplicates, never passageways or traversable
-    ground, never objects resting on holders (counters, tables,
-    shelves: orientation, not obstructions), never entries floating
-    above walking height (close but high in the frame). Verdict: clear
-    | blocked | no_goal_visible (question names a goal absent from the
-    scene; exit-phrase inference never produces this — it fires only on
-    a visible match). height is the image height in px (0 skips the
-    floor-standing check).
+
+def _area(e: dict[str, Any]) -> int:
+    b = e["box"]
+    return (b[2] - b[0]) * (b[3] - b[1])
+
+
+def _distance_subject(question: str) -> str:
+    """What a distance question asks about ('how far is the X' /
+    'how far to the X'), trailing filler dropped; '' when none."""
+    for rx in (DISTANCE_TO_RE, DISTANCE_SUBJECT_RE):
+        m = rx.search(question or "")
+        if not m:
+            continue
+        words = m.group(1).strip().lower().split()
+        while words and words[-1] in (DISTANCE_TAIL_WORDS
+                                      | REACH_TAIL_WORDS):
+            words.pop()
+        if words:
+            return " ".join(words[:4])
+    return ""
+
+
+def _resolve_goal(
+    scene: list[dict[str, Any]], question: str, hint: str = ""
+) -> dict[str, Any]:
+    """Rule 1 — the goal is what the question names.
+
+    In order: the reach target ('path to the X', 'get to X', 'reach X'),
+    a goal word (door, exit, stairs...), the subject of a distance
+    question ('how far is the X'). A pronoun in that slot ('how far are
+    they', 'path to it') names the prior referent (hint, the follow-up's
+    subject). Only a question that names nothing falls back to exit
+    inference: a leaving phrase picks a visible door/exit. named=True
+    means a goal was named, so its absence is no_goal_visible.
     """
-    words = set(re.findall(r"[a-z]+", (question or "").lower()))
-    goal_words = [w for w in words if w in GOAL_WORDS]
-    reach = "" if goal_words else _reach_target(question)
-    goal: dict[str, Any] | None = None
-    goal_aliases: list[str] = []
-    goal_desc = "exit"
-    if goal_words:
-        cands = []
-        for e in scene:
-            name = str(e.get("name", "")).lower()
-            for w in goal_words:
-                if any(a in name for a in GOAL_ALIASES.get(w, [w])):
-                    cands.append(e)
-                    break
-        if cands:
-            goal = max(cands, key=lambda e: (e["box"][2] - e["box"][0])
-                       * (e["box"][3] - e["box"][1]))
-            for w in goal_words:
-                goal_aliases.extend(GOAL_ALIASES.get(w, [w]))
-            goal_desc = goal_words[0] if len(goal_words) == 1 else "exit"
-    elif reach:
-        aliases = _reach_aliases(reach)
+    q = question or ""
+    words = set(re.findall(r"[a-z]+", q.lower()))
+    phrase, aliases = "", []
+    reach = _reach_target(q)
+    subject = _distance_subject(q)
+    goal_words = sorted(w for w in words if w in GOAL_WORDS)
+
+    def pronoun(slot: str) -> bool:
+        return bool(slot) and slot.split()[0] in PRONOUN_WORDS
+
+    if reach and not pronoun(reach):
+        phrase, aliases = reach, _reach_aliases(reach)
+    elif goal_words:
+        aliases = [a for w in goal_words for a in GOAL_ALIASES.get(w, [w])]
+        phrase = goal_words[0] if len(goal_words) == 1 else "exit"
+    elif subject and not pronoun(subject):
+        phrase, aliases = subject, _reach_aliases(subject)
+    elif hint and (pronoun(reach) or pronoun(subject)):
+        phrase = hint.strip().lower()
+        aliases = _reach_aliases(phrase)
+    if phrase:
         cands = [e for e in scene
-                 if any(a in str(e.get("name", "")).lower()
-                        for a in aliases)]
-        if cands:
-            goal = max(cands, key=lambda e: (e["box"][2] - e["box"][0])
-                       * (e["box"][3] - e["box"][1]))
-            goal_aliases.extend(aliases)
-            goal_desc = reach
-    if (goal_words or reach) and goal is None:
-        return {"goal": None, "goal_clock": None,
-                "verdict": "no_goal_visible", "on_path": [],
-                "goal_desc": goal_desc}
-    if goal is None and EXIT_PHRASE_RE.search(question or ""):
+                 if any(a in str(e.get("name", "")).lower() for a in aliases)]
+        goal = max(cands, key=_area) if cands else None
+        if goal is not None and phrase in GOAL_WORDS | {"exit"}:
+            # A goal word is a category ("exit"): name the thing found
+            # ("door"). A named target keeps the user's word ("fridge").
+            phrase = _head_noun(str(goal.get("name", ""))) or phrase
+        return {"goal": goal, "aliases": aliases, "desc": phrase,
+                "named": True}
+    if EXIT_PHRASE_RE.search(q):
         cands = [e for e in scene
                  if any(a in str(e.get("name", "")).lower()
                         for a in EXIT_GOAL_ALIASES)]
         if cands:
-            goal = max(cands, key=lambda e: (e["box"][2] - e["box"][0])
-                       * (e["box"][3] - e["box"][1]))
-            goal_aliases.extend(EXIT_GOAL_ALIASES)
-    goal_clock = int(goal["clock"]) if goal else 12
-    goal_rank = SIZE_RANK.get(str((goal or {}).get("size_class", "far")), 2)
+            goal = max(cands, key=_area)
+            return {"goal": goal, "aliases": list(EXIT_GOAL_ALIASES),
+                    "desc": _head_noun(str(goal.get("name", ""))) or "exit",
+                    "named": False}
+    return {"goal": None, "aliases": [], "desc": "exit", "named": False}
 
-    def clock_dist(a: int, b: int) -> int:
-        return min(abs(a - b), 12 - abs(a - b))
 
-    def is_passable(name: str) -> bool:
-        return any(re.search(r"\b" + re.escape(s) + r"\b", name)
-                   for s in SURFACE_WORDS | PASSABLE_WORDS)
+def _box_pair(e: dict[str, Any], goal: dict[str, Any]) -> tuple[float, float]:
+    """(fraction of e's box inside the goal box, area ratio e/goal)."""
+    try:
+        x1, y1, x2, y2 = (int(v) for v in e.get("box", [0, 0, 0, 0]))
+        gx1, gy1, gx2, gy2 = (int(v) for v in goal.get("box", [0, 0, 0, 0]))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    inter = max(0, min(x2, gx2) - max(x1, gx1)) * max(
+        0, min(y2, gy2) - max(y1, gy1))
+    area = max(1, (x2 - x1) * (y2 - y1))
+    garea = max(1, (gx2 - gx1) * (gy2 - gy1))
+    return inter / area, area / garea
 
-    holders = []
-    for e in scene:
-        name = str(e.get("name", "")).lower()
-        if any(re.search(r"\b" + re.escape(h) + r"\b", name)
-               for h in HOLDER_WORDS):
-            holders.append(e.get("box", [0, 0, 0, 0]))
 
-    def rests_on_holder(box: list[int] | tuple[int, ...]) -> bool:
-        try:
-            x1, _, x2, yb = (int(v) for v in box)
-        except (TypeError, ValueError):
-            return False
-        for h in holders:
-            try:
-                hx1, hy1, hx2, hy2 = (int(v) for v in h)
-            except (TypeError, ValueError):
-                continue
-            overlap = max(0, min(x2, hx2) - max(x1, hx1))
-            if overlap > 0.3 * max(1, x2 - x1) \
-                    and yb <= hy1 + 0.5 * (hy2 - hy1):
-                return True
+def _rests_on(e: dict[str, Any], holders: list[Any]) -> bool:
+    """Base at/above a holder's vertical middle, with horizontal overlap."""
+    try:
+        x1, _, x2, yb = (int(v) for v in e.get("box", [0, 0, 0, 0]))
+    except (TypeError, ValueError):
         return False
-
-    def _box_pair(e: dict[str, Any]) -> tuple[float, float]:
-        # (fraction of the entry box inside the goal box, area ratio
-        # entry/goal). Shared by the part and echo checks below.
+    for h in holders:
         try:
-            x1, y1, x2, y2 = (int(v) for v in e.get("box", [0, 0, 0, 0]))
-            gx1, gy1, gx2, gy2 = (
-                int(v) for v in (goal or {}).get("box", [0, 0, 0, 0]))
+            hx1, hy1, hx2, hy2 = (int(v) for v in h)
         except (TypeError, ValueError):
-            return 0.0, 0.0
-        inter = max(0, min(x2, gx2) - max(x1, gx1)) * max(
-            0, min(y2, gy2) - max(y1, gy1))
-        area = max(1, (x2 - x1) * (y2 - y1))
-        garea = max(1, (gx2 - gx1) * (gy2 - gy1))
-        return inter / area, area / garea
+            continue
+        overlap = max(0, min(x2, hx2) - max(x1, hx1))
+        if overlap > 0.3 * max(1, x2 - x1) \
+                and yb <= hy1 + 0.5 * (hy2 - hy1):
+            return True
+    return False
 
-    def is_goal_part(e: dict[str, Any]) -> bool:
-        if goal is None:
-            return False
-        name = str(e.get("name", "")).lower()
-        if not any(re.search(r"\b" + re.escape(w) + r"\b", name)
-                   for w in GOAL_PART_WORDS):
-            return False
-        return _box_pair(e)[0] > 0.7
 
-    def is_goal_echo(e: dict[str, Any]) -> bool:
-        # A re-grounding of the goal itself under another name (naming
-        # proposed "countertop appliance", SAM returned the fridge's
-        # box): near-identical box, so it can never be an obstruction.
-        # The area-ratio floor keeps genuine small obstructions
-        # silhouetted against a big goal (toy before a couch) on-path.
-        if goal is None or e is goal:
-            return False
-        contained, ratio = _box_pair(e)
-        return contained >= 0.9 and ratio >= 0.5
+def _not_obstruction(
+    e: dict[str, Any],
+    goal: dict[str, Any] | None,
+    goal_aliases: list[str],
+    holders: list[Any],
+    height: int,
+) -> str:
+    """Rule 2 — why e is not an obstruction ('' when it may be one).
 
+    An obstruction is a floor-standing object. Never obstructions, in
+    order: the goal and its duplicates (rule 1); parts of the goal
+    (drawer, handle... mostly inside its box); goal echoes (the goal
+    re-grounded under another name: >=90% inside its box at >=0.5 of its
+    area — the floor keeps a toy before a couch on-path); surfaces;
+    ground cover (patio, lawn, sidewalk...); passageways; objects resting
+    on a holder (counter, table, shelf); objects whose base floats above
+    walking height for their distance.
+    """
+    name = str(e.get("name", "")).lower()
+    if goal is not None and e is goal:
+        return "goal"
+    if any(a in name for a in goal_aliases):
+        return "goal"
+    if goal is not None:
+        contained, ratio = _box_pair(e, goal)
+        if _has_word(name, GOAL_PART_WORDS) and contained > 0.7:
+            return "goal_part"
+        if contained >= 0.9 and ratio >= 0.5:
+            return "goal_echo"
+    if _has_word(name, SURFACE_WORDS):
+        return "surface"
+    if _has_word(name, GROUND_WORDS):
+        return "ground_cover"
+    if _has_word(name, PASSABLE_WORDS):
+        return "passage"
+    if _rests_on(e, holders):
+        return "supported"
+    if not _stands_on_floor(e, height):
+        return "elevated"
+    return ""
+
+
+def _is_door_goal(goal: dict[str, Any] | None) -> bool:
+    # Head noun, not any word: a "french-door refrigerator" is a fridge.
+    return goal is not None and \
+        _head_noun(str(goal.get("name", ""))) in DOOR_GOAL_WORDS
+
+
+def _passage(
+    goal: dict[str, Any] | None,
+    scene: list[dict[str, Any]],
+    openings: list[Any],
+    width: int,
+    height: int,
+) -> tuple[tuple[int, int, int, int], str]:
+    """The box the route ends at, and where it came from.
+
+    No goal: straight ahead to the top of the frame. A door: the opening
+    beside (or under) the leaf — a segmented 'open doorway' or a
+    doorway/hallway entry next to it, nearest first; with none found, an
+    open leaf is widened by its own width each side (the opening is on
+    one side, unknown which), a closed one is its own opening. Any other
+    goal: its own box.
+    """
+    if goal is None:
+        return ((int(CORRIDOR_AHEAD[0] * width), 0,
+                 int(CORRIDOR_AHEAD[1] * width), 0), "ahead")
+    gx1, gy1, gx2, gy2 = (int(v) for v in goal["box"])
+    if not _is_door_goal(goal):
+        return (gx1, gy1, gx2, gy2), "goal"
+    gw = max(1, gx2 - gx1)
+    cands = [tuple(int(v) for v in b) for b in openings]
+    cands += [tuple(int(v) for v in e["box"]) for e in scene
+              if e is not goal
+              and _has_word(str(e.get("name", "")).lower(), OPENING_WORDS)]
+    near = [b for b in cands
+            if max(b[0], gx1) - min(b[2], gx2) <= 0.25 * gw  # beside/over
+            and b[3] >= gy2 - 0.15 * height]                 # same depth
+    if near:
+        return max(near, key=lambda b: b[3]), "opening"
+    if "open" in str(goal.get("name", "")).lower():
+        return ((max(0, gx1 - gw), gy1, min(width, gx2 + gw), gy2),
+                "leaf_widened")
+    return (gx1, gy1, gx2, gy2), "leaf"
+
+
+def _in_corridor(
+    e: dict[str, Any],
+    passage: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> bool:
+    """Footprint (box base) inside the corridor from the user's feet to
+    the passage base — or lying in the opening's lower band."""
+    x1, y1, x2, y2 = (int(v) for v in e["box"])
+    px1, py1, px2, py2 = passage
+    if y2 < py2 - PASSAGE_TOL * height:
+        # Past the passage base: on the route only when lying in the
+        # opening itself (the threshold and just beyond).
+        band = py2 - PASSAGE_BAND * max(1, py2 - py1)
+        return y2 >= band and min(x2, px2) - max(x1, px1) \
+            > CORRIDOR_MIN_OVERLAP * max(1, min(x2 - x1, px2 - px1))
+    # No margin at the passage: things beside the opening (wall-side
+    # guitars) are not in it.
+    t = min(1.0, max(0.0, (y2 - py2) / max(1, height - py2)))
+    left = px1 + t * (CORRIDOR_NEAR[0] * width - px1)
+    right = px2 + t * (CORRIDOR_NEAR[1] * width - px2)
+    return min(x2, right) - max(x1, left) \
+        > CORRIDOR_MIN_OVERLAP * max(1.0, min(x2 - x1, right - left))
+
+
+def passage_look(
+    image: bytes, scene: list[dict[str, Any]], question: str,
+    hint: str = "",
+) -> list[tuple[int, int, int, int]]:
+    """A door goal's opening, segmented: the leaf is not the way
+    through. [] for any other goal (one SAM call only for doors)."""
+    if not _is_door_goal(_resolve_goal(scene, question, hint)["goal"]):
+        return []
+    records = _run_stage(
+        "segmentation", lambda: sam_segment(image, OPENING_PHRASE))
+    return [r["box"] for r in records]
+
+
+def _path_assessment(
+    scene: list[dict[str, Any]], question: str, height: int = 0,
+    hint: str = "", width: int = 0, openings: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Facts about the route, computed — not free-reasoned.
+
+    Goal: rule 1 (_resolve_goal); no goal means straight ahead.
+    Obstructions: rule 2 (_not_obstruction) whose footprint is inside the
+    corridor to the passage (_passage, _in_corridor) — geometry, not
+    clock offset. Verdict: clear | blocked | no_goal_visible (a named
+    goal absent from the scene; exit inference never produces this).
+    width/height are the image size in px (0: taken from the boxes'
+    extent, for callers without an image; height 0 also skips the
+    floor-standing check). openings are segmented door openings
+    (passage_look). hint is the prior referent a pronoun resolves to.
+    """
+    g = _resolve_goal(scene, question, hint)
+    goal, goal_desc = g["goal"], g["desc"]
+    if g["named"] and goal is None:
+        return {"goal": None, "goal_clock": None, "goal_size": None,
+                "verdict": "no_goal_visible", "on_path": [],
+                "goal_desc": goal_desc}
+    goal_clock = int(goal["clock"]) if goal else 12
+    w = width or max([int(e["box"][2]) for e in scene] or [1])
+    h = height or max([int(e["box"][3]) for e in scene] or [1])
+    passage, passage_src = _passage(goal, scene, openings or [], w, h)
+    goal_size = str(goal.get("size_class", "")) if goal else None
+    if passage_src == "opening":
+        # Point the user at the way through, not at the leaf.
+        goal_clock = clock_of(passage, w)
+        goal_size = size_class_of(passage, h)
+
+    holders = [e.get("box", [0, 0, 0, 0]) for e in scene
+               if _has_word(str(e.get("name", "")).lower(), HOLDER_WORDS)]
     on_path = []
     for e in scene:
-        if goal is not None and e is goal:
+        if _not_obstruction(e, goal, g["aliases"], holders, height):
             continue
-        name = str(e.get("name", "")).lower()
-        if any(a in name for a in goal_aliases):
-            continue
-        if is_passable(name):
-            continue
-        if rests_on_holder(e.get("box", [0, 0, 0, 0])):
-            continue
-        if is_goal_part(e):
-            continue
-        if is_goal_echo(e):
-            continue
-        if not _stands_on_floor(e, height):
-            continue
-        rank = SIZE_RANK.get(str(e.get("size_class", "far")), 2)
-        # Betweenness by distance rank: nearer than the goal counts, and
-        # when the goal itself is close, same-corridor near objects (a
-        # few steps away) count too — a close goal must not certify the
-        # last steps sight-unseen.
-        if clock_dist(int(e.get("clock", 12)), goal_clock) <= 1 \
-                and rank <= max(goal_rank, 1):
+        if _in_corridor(e, passage, w, h):
             on_path.append(e)
     on_path.sort(key=lambda e: SIZE_RANK.get(
         str(e.get("size_class", "far")), 2))
     return {
         "goal": (str(goal["name"]) if goal else None),
         "goal_clock": goal_clock,
+        "goal_size": goal_size,
         "goal_desc": goal_desc,
+        "through": passage_src == "opening",
         "verdict": "clear" if not on_path else "blocked",
+        "passage": list(passage),
+        "passage_source": passage_src,
         "on_path": [
             {"name": str(e.get("name", "")),
              "clock": int(e.get("clock", 12)),
@@ -939,6 +1283,18 @@ def route(question: str) -> tuple[str, str | None]:
     return "A", None
 
 
+# A labeled number stated in a trailing clause ("find my mailbox, it's
+# number 16") — the target cut drops that clause, and with it the only
+# thing that identifies the instance.
+CLAUSE_NUMBER_RE = re.compile(
+    r"\b(?:number|no\.?|#)\s*(\d+[a-z]?)\b", re.IGNORECASE)
+
+
+def clause_qualifier(question: str) -> str | None:
+    m = CLAUSE_NUMBER_RE.search(question or "")
+    return f"number {m.group(1)}" if m else None
+
+
 def split_qualifier(target: str) -> tuple[str, str | None]:
     """Fix 4: split a find-target into (SAM noun prompt, qualifier).
 
@@ -990,10 +1346,12 @@ def audio_enabled() -> bool:
     )
 
 
-def to_wav_16k_mono(data: bytes) -> bytes | None:
+def to_wav_16k_mono(data: bytes) -> bytes:
     """16 kHz mono WAV for ASR. Already-there input passes through;
     anything else goes through ffmpeg (mirrors audio_probe.extract).
-    None on any failure — the ask never fails for audio reasons."""
+    b"" when the media has no audio stream (nothing was said — not a
+    failure); raises on conversion failure so the transcription stage
+    retries and then errors the ask."""
     try:
         with wave.open(io.BytesIO(data), "rb") as w:
             if (w.getframerate() == 16000 and w.getnchannels() == 1
@@ -1003,53 +1361,60 @@ def to_wav_16k_mono(data: bytes) -> bytes | None:
         pass
     ffmpeg = FFMPEG if os.path.exists(FFMPEG) else shutil.which("ffmpeg")
     if not ffmpeg:
-        return None
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            src = os.path.join(td, "in")
-            dst = os.path.join(td, "out.wav")
-            with open(src, "wb") as f:
-                f.write(data)
-            subprocess.run(
-                [ffmpeg, "-y", "-v", "error", "-i", src,
-                 "-vn", "-ac", "1", "-ar", "16000", dst],
-                timeout=60, check=True,
-            )
-            if not os.path.exists(dst) or os.path.getsize(dst) == 0:
-                return None
-            with open(dst, "rb") as f:
-                return f.read()
-    except Exception:
-        return None
+        raise PipelineError("ffmpeg not found")
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "in")
+        dst = os.path.join(td, "out.wav")
+        with open(src, "wb") as f:
+            f.write(data)
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-i", src,
+             "-vn", "-ac", "1", "-ar", "16000", dst],
+            timeout=60, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            if "does not contain any stream" in (proc.stderr or ""):
+                return b""
+            raise PipelineError(
+                f"ffmpeg failed: {(proc.stderr or '').strip()[:200]}")
+        if not os.path.exists(dst) or os.path.getsize(dst) == 0:
+            return b""
+        with open(dst, "rb") as f:
+            return f.read()
 
 
 def transcribe_audio(wav_bytes: bytes | None) -> str:
-    """Speech -> text via /v1/asr/transcribe. '' on any failure."""
+    """Speech -> text via /v1/asr/transcribe. '' when there is nothing
+    to transcribe or nothing was said; raises on API failure — "I
+    didn't catch a question" must mean silence, not a dead ASR."""
     if not wav_bytes:
         return ""
-    try:
-        key = _load_key()
-        if not key:
-            return ""
-        r = requests.post(
-            ASR_ENDPOINT,
-            headers={"Authorization": f"Bearer {key}"},
-            files={
-                "request": (
-                    None,
-                    json.dumps({"model": ASR_MODEL,
-                                "audioEncoding": "WAV"}),
-                    "application/json",
-                ),
-                "audio": ("ask.wav", wav_bytes, "audio/wav"),
-            },
-            timeout=ASR_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return ""
-        return str(r.json().get("transcript", "") or "").strip()
-    except Exception:
-        return ""
+    key = _load_key()
+    if not key:
+        raise PipelineError("META_MODEL_API_KEY is not set")
+    r = requests.post(
+        ASR_ENDPOINT,
+        headers={"Authorization": f"Bearer {key}"},
+        files={
+            "request": (
+                None,
+                json.dumps({"model": ASR_MODEL,
+                            "audioEncoding": "WAV"}),
+                "application/json",
+            ),
+            "audio": ("ask.wav", wav_bytes, "audio/wav"),
+        },
+        timeout=ASR_TIMEOUT,
+    )
+    if r.status_code != 200:
+        raise PipelineError(f"ASR HTTP {r.status_code}: {r.text[:200]}")
+    return str(r.json().get("transcript", "") or "").strip()
+
+
+def transcribe_question(media: bytes) -> str:
+    """Transcription stage: convert + transcribe, retry once, then error."""
+    return _run_stage(
+        "transcription", lambda: transcribe_audio(to_wav_16k_mono(media)))
 
 
 def jev_state(
@@ -1094,7 +1459,9 @@ def jev_state(
 
 def jev_intents(state: str) -> dict[str, float] | None:
     """Fix 1: one call, three intent factors. None when the layer is
-    disabled, keyless, or erroring — the caller falls back to regex."""
+    disabled or keyless (configuration — the regex layer stands alone).
+    An enabled layer that errors is a stage that did not run: retry
+    once, then StageFailed — never a silent drop to regex-only."""
     if not jev_enabled():
         return None
     key = _load_secret("JEV_API_KEY")
@@ -1106,7 +1473,8 @@ def jev_intents(state: str) -> dict[str, float] | None:
             for name, instr in JEV_QUESTIONS.items()
         },
     }
-    try:
+
+    def attempt() -> dict[str, float]:
         r = requests.post(
             JEV_ENDPOINT,
             headers={"Authorization": f"Bearer {key}",
@@ -1115,14 +1483,14 @@ def jev_intents(state: str) -> dict[str, float] | None:
             timeout=JEV_TIMEOUT,
         )
         if r.status_code != 200:
-            return None
+            raise PipelineError(f"Jev HTTP {r.status_code}")
         answers = r.json().get("answers", {})
         out = {}
         for name in JEV_QUESTIONS:
             out[name] = max(0.0, min(1.0, float(answers[name]["noul"])))
         return out
-    except Exception:
-        return None
+
+    return _run_stage("intent_gate", attempt)
 
 
 def combine_gate(
@@ -1279,6 +1647,8 @@ def _head_noun(name: str) -> str:
     """Last word, lowercased, articles stripped, lightly singularized."""
     words = re.sub(r"^(a|an|the)\s+", "",
                    (name or "").strip().lower()).split()
+    while len(words) > 1 and words[-1] in POSITION_TAIL_WORDS:
+        words.pop()
     head = words[-1] if words else ""
     if len(head) > 3 and head.endswith("s") \
             and not head.endswith(("ss", "us", "is")):
@@ -1287,7 +1657,7 @@ def _head_noun(name: str) -> str:
 
 
 def _same_object(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """Same normalized head noun + overlapping boxes = same instance."""
+    """Same head noun + near-duplicate boxes = a segmentation echo."""
     if _head_noun(str(a.get("name", ""))) != _head_noun(str(b.get("name", ""))):
         return False
     try:
@@ -1297,23 +1667,29 @@ def _same_object(a: dict[str, Any], b: dict[str, Any]) -> bool:
         return False
     if len(ba) != 4 or len(bb) != 4:
         return False
-    return iou(ba, bb) > MERGE_IOU
+    if iou(ba, bb) >= MERGE_IOU:
+        return True
+    small, big = sorted(({"box": ba}, {"box": bb}), key=_area)
+    contained, ratio = _box_pair(small, big)
+    return contained >= MERGE_CONTAIN and ratio >= MERGE_AREA_RATIO
 
 
 def merge_entries(scene: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse duplicate instances of the same object.
 
-    Same head noun + overlapping boxes merge into one entry, keeping the
-    longest (most descriptive) name, the highest confidence, the nearest
-    size class, and the highest-confidence member's box and clock. Extras
+    Echoes (_same_object) merge into one entry, keeping the longest
+    (most descriptive) name, the highest confidence, the nearest size
+    class, and the highest-confidence member's box and clock. Extras
     (Flow C label/match) come from a matched member when any matched.
-    Group order follows first appearance.
+    An entry joins a group only when it echoes every member, so
+    overlapping instances never chain into one. Group order follows
+    first appearance.
     """
     groups: list[list[dict[str, Any]]] = []
     for e in scene:
         placed = False
         for g in groups:
-            if any(_same_object(e, m) for m in g):
+            if all(_same_object(e, m) for m in g):
                 g.append(e)
                 placed = True
                 break
@@ -1358,6 +1734,475 @@ def merge_entries(scene: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+def ship_scene(scene: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The scene as shipped (chips, eval, History): entries with the same
+    name and clock collapse to one, carrying "instances" when > 1
+    ("off-white wall" x6 is one chip). Display only — counting, the path
+    and follow-ups use the full scene."""
+    out: list[dict[str, Any]] = []
+    seen: dict[tuple[str, Any], dict[str, Any]] = {}
+    for e in scene:
+        key = (str(e.get("name", "")).strip().lower(), e.get("clock"))
+        if key in seen:
+            seen[key]["instances"] = seen[key].get("instances", 1) + 1
+            continue
+        ent = dict(e)
+        seen[key] = ent
+        out.append(ent)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Counting — the scene's instances are the count
+# ----------------------------------------------------------------------------
+
+def _singular(word: str) -> str:
+    w = (word or "").lower()
+    if w in IRREGULAR_SINGULAR:
+        return IRREGULAR_SINGULAR[w]
+    if w in PLURAL_ONLY or len(w) <= 3:
+        return w
+    if w.endswith("ies"):
+        return w[:-3] + "y"
+    if w.endswith(("ches", "shes", "xes", "sses", "zes")):
+        return w[:-2]
+    if w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
+def count_subject(question: str) -> str | None:
+    """'How many cats are in this room?' -> 'cats'. None when the
+    question is not a count, or asks how far ('how many steps')."""
+    q = question or ""
+    if DISTANCE_RE.search(q):
+        return None
+    m = COUNT_RE.search(q)
+    if not m:
+        return None
+    words: list[str] = []
+    for w in re.findall(r"[a-z][a-z'-]*", m.group(1).lower()):
+        if w in COUNT_STOP_WORDS:
+            break
+        words.append(w)
+    while words and words[0] in {"the", "my", "a", "an", "of"}:
+        words.pop(0)
+    return " ".join(words) or None
+
+
+def _count_unit(name: str) -> str:
+    """Singular head word of a scene name, position words dropped."""
+    words = re.sub(r"^(a|an|the)\s+", "",
+                   (name or "").strip().lower()).split()
+    while len(words) > 1 and words[-1] in POSITION_TAIL_WORDS:
+        words.pop()
+    return _singular(words[-1]) if words else ""
+
+
+def count_instances(
+    scene: list[dict[str, Any]], subject: str
+) -> list[dict[str, Any]]:
+    """Scene entries that are instances of the asked noun. A group noun
+    with no entries of its own ('mailbox banks') counts its member noun."""
+    words = subject.split()
+    if not words:
+        return []
+    head = _singular(words[-1])
+    hits = [e for e in scene if _count_unit(str(e.get("name", ""))) == head]
+    if not hits and head in COUNT_GROUP_NOUNS and len(words) > 1:
+        member = _singular(words[-2])
+        hits = [e for e in scene
+                if _count_unit(str(e.get("name", ""))) == member]
+    return hits
+
+
+def count_look(
+    image: bytes, scene: list[dict[str, Any]], question: str,
+    media: bytes | None = None,
+) -> list[dict[str, Any]]:
+    """Segment the asked noun so its instances are in the scene even
+    when naming never listed it (a follow-up 'how many cups'). With the
+    ask's clip, the class's instances become the union across its
+    frames (clip_union)."""
+    subject = count_subject(question)
+    if not subject:
+        return scene
+    words = subject.split()
+    phrase = " ".join(words[:-1] + [_singular(words[-1])])
+    with Image.open(io.BytesIO(image)) as im:
+        width, height = im.size
+    records = _run_stage("segmentation", lambda: sam_segment(image, phrase))
+    found = [entry_for(phrase, r["box"], r["confidence"], width, height)
+             for r in records]
+    scene = merge_entries(scene + found) if found else scene
+    if media:
+        scene = clip_union(image, scene, subject, phrase, media)
+    return scene
+
+
+def clip_frames(media: bytes, fps: int = CLIP_SCAN_FPS,
+                n: int = CLIP_SCAN_MAX) -> list[bytes]:
+    """Up to n JPEG frames at fps, spread over the clip (upright: ffmpeg
+    applies the rotation). [] when the media has no video stream."""
+    ffmpeg = FFMPEG if os.path.exists(FFMPEG) else shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise PipelineError("ffmpeg not found")
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "in")
+        with open(src, "wb") as f:
+            f.write(media)
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-i", src, "-an",
+             "-vf", f"fps={fps}", "-q:v", "3",
+             os.path.join(td, "f_%04d.jpg")],
+            timeout=60, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            if "does not contain any stream" in (proc.stderr or "") \
+                    or "matches no streams" in (proc.stderr or ""):
+                return []
+            raise PipelineError(
+                f"ffmpeg frames failed: {(proc.stderr or '').strip()[:200]}")
+        names = sorted(f for f in os.listdir(td) if f.startswith("f_"))
+        if len(names) > n:
+            names = [names[round(i * (len(names) - 1) / (n - 1))]
+                     for i in range(n)]
+        out = []
+        for name in names:
+            with open(os.path.join(td, name), "rb") as f:
+                out.append(f.read())
+        return out
+
+
+def _thumb(data: bytes, size: tuple[int, int]) -> Image.Image:
+    with Image.open(io.BytesIO(data)) as im:
+        im = im.convert("L").resize(size)
+        return im.copy()
+
+
+def _sharpness(data: bytes) -> float:
+    """Edge energy at SHARP_W wide: motion blur scores low."""
+    with Image.open(io.BytesIO(data)) as im:
+        g = im.convert("L")
+        g = g.resize((SHARP_W, max(1, round(SHARP_W * g.size[1]
+                                            / g.size[0]))))
+    return ImageStat.Stat(g.filter(ImageFilter.FIND_EDGES)).mean[0]
+
+
+def _pan_scored(
+    a: Image.Image, b: Image.Image
+) -> tuple[tuple[int, int] | None, float]:
+    """(offset, best/median diff ratio). Offset (dx, dy), in thumbnail
+    px, such that b's pixel (x, y) shows what a shows at (x + dx,
+    y + dy); None when no shift matches clearly (the frames don't
+    overlap, or the scene is featureless)."""
+    w, h = a.size
+
+    def diff(dx: int, dy: int) -> float | None:
+        ax1, ay1 = max(0, dx), max(0, dy)
+        ax2, ay2 = min(w, w + dx), min(h, h + dy)
+        if (ax2 - ax1) * (ay2 - ay1) < REG_MIN_OVERLAP * w * h:
+            return None
+        ca = a.crop((ax1, ay1, ax2, ay2))
+        cb = b.crop((ax1 - dx, ay1 - dy, ax2 - dx, ay2 - dy))
+        return ImageStat.Stat(ImageChops.difference(ca, cb)).mean[0]
+
+    rx, ry = int(REG_MAX_DX * w), int(REG_MAX_DY * h)
+    scores = {}
+    for dy in range(-ry, ry + 1, 2):
+        for dx in range(-rx, rx + 1, 2):
+            d = diff(dx, dy)
+            if d is not None:
+                scores[(dx, dy)] = d
+    if not scores:
+        return None, 1.0
+    (bx, by), _ = min(scores.items(), key=lambda kv: kv[1])
+    for dy in range(by - 1, by + 2):
+        for dx in range(bx - 1, bx + 2):
+            d = diff(dx, dy)
+            if d is not None:
+                scores[(dx, dy)] = d
+    best_at, best = min(scores.items(), key=lambda kv: kv[1])
+    median = sorted(scores.values())[len(scores) // 2]
+    ratio = best / median if median > 0 else 1.0
+    return (best_at if ratio <= REG_MAX_RATIO else None), ratio
+
+
+def _pan(a: Image.Image, b: Image.Image) -> tuple[int, int] | None:
+    return _pan_scored(a, b)[0]
+
+
+def _edge(box: Any, w: int, h: int) -> bool:
+    x1, y1, x2, y2 = box
+    return (x1 <= EDGE_PX or y1 <= EDGE_PX
+            or x2 >= w - EDGE_PX or y2 >= h - EDGE_PX)
+
+
+def key_frames(
+    frames: list[bytes], tsize: tuple[int, int]
+) -> tuple[list[int], list[int], list[tuple[float, float]], list[Any]]:
+    """Scan the clip locally: link consecutive frames by pan, cut views.
+
+    Returns (keys, segment, pos, thumbs): key frame indices; each frame's
+    segment id (a new segment where a pair cannot be linked — a whip pan
+    or a blur too strong to match); each frame's position, in thumbnail
+    px, relative to its segment's first frame; the thumbnails. A view
+    ends once the camera has moved CLIP_KEY_SHIFT of a frame from where
+    it began; its sharpest frame is its key frame. At most CLIP_KEY_MAX
+    keys (the shift grows until they fit)."""
+    thumbs = [_thumb(f, tsize) for f in frames]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=FANOUT_WORKERS
+    ) as pool:
+        steps = list(pool.map(lambda k: _pan(thumbs[k], thumbs[k + 1]),
+                              range(len(frames) - 1)))
+        sharp = list(pool.map(_sharpness, frames))
+    seg = [0] * len(frames)
+    pos: list[tuple[float, float]] = [(0.0, 0.0)] * len(frames)
+    for k, st in enumerate(steps):
+        if st is None:
+            seg[k + 1] = seg[k] + 1
+        else:
+            seg[k + 1] = seg[k]
+            pos[k + 1] = (pos[k][0] + st[0], pos[k][1] + st[1])
+    tw, th = tsize
+    shift = CLIP_KEY_SHIFT
+    while True:
+        views: list[list[int]] = []
+        for k in range(len(frames)):
+            if views and seg[views[-1][0]] == seg[k]:
+                x0, y0 = pos[views[-1][0]]
+                if abs(pos[k][0] - x0) <= shift * tw \
+                        and abs(pos[k][1] - y0) <= shift * th:
+                    views[-1].append(k)
+                    continue
+            views.append([k])
+        if len(views) <= CLIP_KEY_MAX or shift > 8:
+            break
+        shift *= 1.25
+    if len(views) > CLIP_KEY_MAX:  # broken sweep: views cannot merge
+        views = [views[round(i * (len(views) - 1) / (CLIP_KEY_MAX - 1))]
+                 for i in range(CLIP_KEY_MAX)]
+    keys = [max(v, key=lambda k: sharp[k]) for v in views]
+    return keys, seg, pos, thumbs
+
+
+def clip_union(
+    image: bytes, scene: list[dict[str, Any]], subject: str, phrase: str,
+    media: bytes,
+) -> list[dict[str, Any]]:
+    """Replace the counted class's scene entries with its instances
+    across the clip (key_frames). Boxes are in the sent photo's
+    coordinates; an instance seen only off that frame keeps its mapped
+    position (clock clamped to 9 or 3). Segments the scan could not link
+    to the photo are counted but cannot be placed: their entries carry
+    linked=False and the count is said as approximate."""
+    frames = _run_stage("clip_frames", lambda: clip_frames(media))
+    if not frames:
+        return scene
+    with Image.open(io.BytesIO(image)) as im:
+        width, height = im.size
+    with Image.open(io.BytesIO(frames[0])) as im:
+        fw, fh = im.size
+    sx, sy = width / fw, height / fh  # frame px -> photo px
+    tsize = (REG_THUMB_W, max(1, round(REG_THUMB_W * height / width)))
+    tscale = width / REG_THUMB_W
+
+    keys, seg, pos, thumbs = key_frames(frames, tsize)
+    # The photo is the clip's middle frame (the app's pick): anchor it to
+    # the best-matching scan frame near the middle.
+    photo = _thumb(image, tsize)
+    mid = len(frames) // 2
+    near = range(max(0, mid - CLIP_ANCHOR_SPAN),
+                 min(len(frames), mid + CLIP_ANCHOR_SPAN + 1))
+    tries = [(k,) + _pan_scored(photo, thumbs[k]) for k in near]
+    tries = [t for t in tries if t[1] is not None]
+    anchor = min(tries, key=lambda t: t[2]) if tries else None
+
+    by_key = sam_many_images([frames[k] for k in keys], phrase)
+    photo_hits = count_instances(scene, subject)
+    if not any(by_key) and not photo_hits:
+        return scene
+    if seg[-1] + 1 > CLIP_MAX_SEGMENTS:
+        # Unlinkable sweep: the best single frame, never a sum of guesses.
+        best = max(range(len(keys)), key=lambda i: len(by_key[i]))
+        if len(by_key[best]) <= len(photo_hits):
+            return scene
+        return [e for e in scene if e not in photo_hits] + [
+            entry_for(phrase, (int(b[0] * sx), int(b[1] * sy),
+                               int(b[2] * sx), int(b[3] * sy)),
+                      c, width, height, frame=keys[best],
+                      clip_union="max_frame")
+            for b, c in by_key[best]]
+    home = seg[anchor[0]] if anchor else None
+
+    def to_photo(k: int, b: Any) -> tuple[int, int, int, int]:
+        # frame k -> anchor frame (same segment) -> photo
+        ax, ay = anchor[1]
+        ox = (pos[k][0] - pos[anchor[0]][0] + ax) * tscale
+        oy = (pos[k][1] - pos[anchor[0]][1] + ay) * tscale
+        return (int(b[0] * sx + ox), int(b[1] * sy + oy),
+                int(b[2] * sx + ox), int(b[3] * sy + oy))
+
+    # Observations: (frame id, box, conf, cut by its frame edge, segment).
+    obs: list[tuple[int, tuple[int, ...], Any, bool, Any]] = []
+    if anchor is not None:
+        for e in photo_hits:
+            obs.append((-1, tuple(int(v) for v in e["box"]),
+                        e.get("confidence"),
+                        _edge(e["box"], width, height), home))
+    for k, recs in zip(keys, by_key):
+        for b, c in recs:
+            if seg[k] == home:
+                pb = to_photo(k, b)
+            else:  # unlinked: own frame coords, scaled; never placed
+                pb = (int(b[0] * sx), int(b[1] * sy),
+                      int(b[2] * sx), int(b[3] * sy))
+            obs.append((k, pb, c, _edge(b, fw, fh), seg[k]))
+    if anchor is None and not obs:
+        return scene
+
+    def match(a: tuple[int, ...], b: tuple[int, ...]) -> float:
+        small, big = sorted(({"box": a}, {"box": b}), key=_area)
+        contained, _ = _box_pair(small, big)
+        v = iou(a, b)
+        return max(v if v >= CLIP_MATCH_IOU else 0.0,
+                   contained if contained >= CLIP_MATCH_CONTAIN else 0.0)
+
+    clusters: list[list[tuple[int, tuple[int, ...], Any, bool, Any]]] = []
+    for o in obs:
+        best_c, best_v = None, 0.0
+        for c in clusters:
+            if c[0][4] != o[4] or any(m[0] == o[0] for m in c):
+                continue  # same segment only; one box per frame
+            v = max(match(o[1], m[1]) for m in c)
+            if v > best_v:
+                best_c, best_v = c, v
+        if best_c is None:
+            clusters.append([o])
+        else:
+            best_c.append(o)
+
+    name = (str(photo_hits[0].get("name")) if photo_hits else phrase)
+    biggest = max(_area({"box": m[1]}) for c in clusters for m in c)
+    out = [e for e in scene if e not in photo_hits]
+    for c in clusters:
+        rep = max(c, key=lambda m: _area({"box": m[1]}))
+        linked = c[0][4] == home
+        cx = min(width - 1, max(0, (rep[1][0] + rep[1][2]) // 2))
+        ent = entry_for(name, rep[1], rep[2], width, height,
+                        frames_seen=len(c), clip_union="registered",
+                        linked=linked,
+                        partial=all(m[3] for m in c)
+                        and _area({"box": rep[1]})
+                        < PARTIAL_AREA_RATIO * biggest)
+        ent["clock"] = clock_of((cx, 0, cx, 0), width)
+        if linked and (rep[1][2] <= 0 or rep[1][0] >= width):
+            ent["off_frame"] = True  # seen in the sweep, outside the photo
+        out.append(ent)
+    return out
+
+
+def sam_many_images(
+    frames: list[bytes], phrase: str
+) -> list[list[tuple[tuple[int, int, int, int], Any]]]:
+    """SAM one phrase over several images concurrently: per frame, a
+    list of (box, confidence). A frame that fails its retry fails the
+    ask (StageFailed), as in sam_many."""
+    def one(f: bytes) -> list[tuple[tuple[int, int, int, int], Any]]:
+        recs = _run_stage("segmentation", lambda: sam_segment(f, phrase))
+        return [(r["box"], r["confidence"]) for r in recs]
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=FANOUT_WORKERS
+    ) as pool:
+        return list(pool.map(one, frames))
+
+
+def _number(n: int) -> str:
+    return NUMBER_WORDS[n] if 0 <= n < len(NUMBER_WORDS) else str(n)
+
+
+def _clock_list(clocks: list[Any]) -> str:
+    uniq: list[str] = []
+    for c in clocks:
+        if str(c) not in uniq:
+            uniq.append(str(c))
+    if len(uniq) == 1:
+        return uniq[0]
+    return ", ".join(uniq[:-1]) + " and " + uniq[-1]
+
+
+def _count_opening(
+    scene: list[dict[str, Any]], subject: str, width: int, height: int
+) -> list[str]:
+    """The count lead, from scene instances only. Instances cut off by
+    the frame edge are said as partial ('part of a fourth')."""
+    words = subject.split()
+    singular = " ".join(words[:-1] + [_singular(words[-1])])
+    if _is_plural(subject):
+        plural = subject
+    elif re.search(r"[^aeiou]y$", singular):
+        plural = singular[:-1] + "ies"
+    elif singular.endswith(("ch", "sh", "x", "s", "z")):
+        plural = singular + "es"
+    else:
+        plural = singular + "s"
+    hits = sorted(count_instances(scene, subject),
+                  key=lambda e: e["box"][0] + e["box"][2])
+    n = len(hits)
+    # A count over a clip's frames covers the whole sweep, not one photo.
+    place = ("in this clip" if any(e.get("clip_union") for e in hits)
+             else "in this photo")
+    if n == 0:
+        return [f"I don't see any {plural} {place}."]
+    if any(e.get("linked") is False for e in hits):
+        # Part of the sweep could not be linked to the rest: the count
+        # may hold one twice, and those positions are unknown.
+        noun = singular if n == 1 else plural
+        return [f"I can see about {_number(n)} {noun} {place}. The camera "
+                f"moved too fast for me to place them all."]
+    biggest = max(_area(e) for e in hits)
+
+    def partial(e: dict[str, Any]) -> bool:
+        if "partial" in e:  # decided across a clip's frames
+            return bool(e["partial"])
+        x1, y1, x2, y2 = e["box"]
+        at_edge = (x1 <= EDGE_PX or y1 <= EDGE_PX
+                   or x2 >= width - EDGE_PX or y2 >= height - EDGE_PX)
+        return at_edge and _area(e) < PARTIAL_AREA_RATIO * biggest
+
+    full = [e for e in hits if not partial(e)]
+    part = [e for e in hits if partial(e)]
+    noun = singular if n == 1 else plural
+    if not part:
+        if n > COUNT_LIST_MAX:
+            first, last = hits[0]["clock"], hits[-1]["clock"]
+            span = (f"at your {first} o'clock" if first == last
+                    else f"from your {first} to your {last} o'clock")
+            return [f"I can see {_number(n)} {noun} {place}, "
+                    f"{span}."]
+        return [f"I can see {_number(n)} {noun} {place}, at your "
+                f"{_clock_list([e['clock'] for e in hits])} o'clock."]
+    pclocks = _clock_list([e["clock"] for e in part])
+    if not full:
+        if len(part) == 1:
+            return [f"I can only see part of one {singular}, at the edge "
+                    f"of the photo at your {pclocks} o'clock."]
+        return [f"I can only see parts of {_number(len(part))} {plural}, "
+                f"at the edge of the photo at your {pclocks} o'clock."]
+    full_desc = "one" if len(full) == 1 else f"{_number(len(full))} full"
+    if len(part) == 1:
+        part_desc = ("part of another" if len(full) == 1 else
+                     f"part of a {ORDINAL_WORDS[n]}"
+                     if n < len(ORDINAL_WORDS) else "part of one more")
+    else:
+        part_desc = f"parts of {_number(len(part))} more"
+    return [f"I can see {_number(n)} {noun} {place}: {full_desc} at "
+            f"your {_clock_list([e['clock'] for e in full])} o'clock, and "
+            f"{part_desc} at the edge, at your {pclocks} o'clock."]
+
+
 # ----------------------------------------------------------------------------
 # Flows
 # ----------------------------------------------------------------------------
@@ -1366,12 +2211,15 @@ def flow_a(image: bytes) -> list[dict[str, Any]]:
     """Open scene: Spark nouns + safety list, one entry per instance."""
     with Image.open(io.BytesIO(image)) as im:
         width, height = im.size
-    try:
-        nouns = parse_nouns(_vlm_text(
-            SPARK_MODEL, image, SPARK_NAMING_PROMPT, SPARK_TIMEOUT
-        ))
-    except PipelineError:
-        nouns = []
+    def name_once() -> list[str]:
+        raw = _vlm_text(SPARK_MODEL, image, SPARK_NAMING_PROMPT,
+                        SPARK_TIMEOUT)
+        # "[]" is an answer (nothing nameable); no array at all is not.
+        if not re.search(r"\[.*\]", raw, re.S):
+            raise _BadOutput(f"naming returned no array: {raw[:80]!r}")
+        return parse_nouns(raw)
+
+    nouns = _run_stage("naming", name_once)
     prompts = list(nouns)
     for s in SAFETY_LIST:
         if s not in prompts:
@@ -1447,12 +2295,11 @@ def flow_c(
         crops.append(buf.getvalue())
 
     def read(crop: bytes) -> str:
-        try:
-            return _vlm_text(
-                WONDER_MODEL, crop, WONDER_READ_PROMPT, WONDER_TIMEOUT
-            ).strip()
-        except Exception:
-            return ""
+        # A failed read is not "no label": treating it as NONE turned
+        # API errors into "I cannot confirm ibuprofen".
+        return _run_stage("label_read", lambda: _vlm_text(
+            CROP_READ_MODEL, crop, WONDER_READ_PROMPT, READ_TIMEOUT
+        ).strip())
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=FANOUT_WORKERS
@@ -1535,27 +2382,23 @@ def floor_look(
     image: bytes, scene: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Second look over floor regions: SAM proposes small floor objects,
-    Wonder reads each proposal. Returns new scene entries (normal
-    clock/size, position-based distance). Never raises — any failure
-    yields no entries rather than failing the ask.
+    Spark reads each proposal. Returns new scene entries (normal
+    clock/size, position-based distance). A SAM or read call that fails
+    its retry fails the ask (StageFailed): a floor look that silently
+    found nothing would certify a path it never checked.
     """
-    try:
-        with Image.open(io.BytesIO(image)) as im:
-            width, height = im.size
-            full = im.convert("RGB")
-    except Exception:
-        return []
+    with Image.open(io.BytesIO(image)) as im:
+        width, height = im.size
+        full = im.convert("RGB")
     found: list[tuple[tuple[int, int, int, int], float | None]] = []
     for region in _floor_regions(scene, width, height):
         x0, y0, x1, y1 = region
         crop = full.crop((max(0, x0), max(0, y0),
                           min(width, x1), min(height, y1)))
         buf = io.BytesIO()
-        try:
-            crop.save(buf, format="JPEG", quality=90)
-            recs = sam_segment(buf.getvalue(), FLOOR_PHRASE)
-        except Exception:
-            continue
+        crop.save(buf, format="JPEG", quality=90)
+        recs = _run_stage("floor_look", lambda: sam_segment(
+            buf.getvalue(), FLOOR_PHRASE))
         for r in recs:
             try:
                 b = r["box"]
@@ -1570,24 +2413,21 @@ def floor_look(
     found = found[:FLOOR_MAX_BOXES]
 
     def read(box: tuple[int, int, int, int]) -> str:
-        try:
-            x1, y1, x2, y2 = box
-            px = max(8, int((x2 - x1) * 0.5))
-            py = max(8, int((y2 - y1) * 0.5))
-            cut = full.crop((max(0, x1 - px), max(0, y1 - py),
-                             min(width, x2 + px), min(height, y2 + py)))
-            if max(cut.size) < 256:
-                s = 256 / max(cut.size)
-                cut = cut.resize((max(1, int(cut.size[0] * s)),
-                                  max(1, int(cut.size[1] * s))))
-            out = io.BytesIO()
-            cut.save(out, format="JPEG", quality=90)
-            return _vlm_text(
-                WONDER_MODEL, out.getvalue(), FLOOR_READ_PROMPT,
-                WONDER_TIMEOUT,
-            ).strip()
-        except Exception:
-            return ""
+        x1, y1, x2, y2 = box
+        px = max(8, int((x2 - x1) * 0.5))
+        py = max(8, int((y2 - y1) * 0.5))
+        cut = full.crop((max(0, x1 - px), max(0, y1 - py),
+                         min(width, x2 + px), min(height, y2 + py)))
+        if max(cut.size) < 256:
+            s = 256 / max(cut.size)
+            cut = cut.resize((max(1, int(cut.size[0] * s)),
+                              max(1, int(cut.size[1] * s))))
+        out = io.BytesIO()
+        cut.save(out, format="JPEG", quality=90)
+        return _run_stage("floor_look", lambda: _vlm_text(
+            CROP_READ_MODEL, out.getvalue(), FLOOR_READ_PROMPT,
+            READ_TIMEOUT,
+        ).strip())
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=FANOUT_WORKERS
@@ -1633,7 +2473,14 @@ def _answer_instruction(
         "matters for footing or orientation, without clock positions. "
         "Never describe what a surface looks like — no colors, materials, "
         "finishes, or patterns. Saying where the camera is aimed "
-        "('pointed up at the sky') is orientation, not decoration."
+        "('pointed up at the sky') is orientation, not decoration. "
+        "Rule 4 — the first sentence directly answers the question; if "
+        "the photo cannot answer it (a sound, a smell, something out of "
+        "view), the first sentence says so plainly — never guess. "
+        "Mention each object at most once. Never walk through the scene "
+        "object by object: name only what answers the question, plus at "
+        "most one nearby landmark for orientation. Use at most three "
+        "short sentences."
         f"{extra}\n"
         f"Question: {q}\n"
         f"Scene model: {json.dumps(scene)}"
@@ -1651,7 +2498,11 @@ def _spark_answer(
     flow: str,
     extra: str = "",
     landmarks: list[dict[str, Any]] | None = None,
+    allow_empty: bool = False,
 ) -> tuple[str, float]:
+    """One composition attempt. allow_empty: the opening is code-written
+    and Spark only adds detail, so "nothing to add" is a valid answer.
+    Unusable output (no answer, broken JSON) raises for the retry."""
     raw = _vlm_text(
         SPARK_MODEL, image,
         _answer_instruction(question, scene, flow, extra, landmarks),
@@ -1663,13 +2514,219 @@ def _spark_answer(
             obj = json.loads(m.group(0))
             answer = str(obj.get("answer", "")).strip()
             conf = float(obj.get("confidence", 0.5))
-            if answer:
-                return answer, max(0.0, min(1.0, conf))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            # Shipping raw '{"answer": ...' text would be read aloud.
+            raise _BadOutput(f"answer JSON unparseable: {raw[:80]!r}")
+        if answer or allow_empty:
+            return answer, max(0.0, min(1.0, conf))
+        raise _BadOutput("answer model returned an empty answer")
     if raw.strip():
         return raw.strip(), 0.5
-    raise PipelineError("Answer model returned empty output")
+    if allow_empty:
+        return "", 0.5
+    raise _BadOutput("Answer model returned empty output")
+
+
+# ----------------------------------------------------------------------------
+# Answer assembly — rules 3 and 4
+# ----------------------------------------------------------------------------
+
+def question_kind(question: str, flow: str, navigation: bool) -> str:
+    """Rule 3 — what the lead sentence must answer.
+
+    distance ('how far') > count ('how many') > path (route words) >
+    find (locate/labeled item) > path by intent alone (Jev navigation,
+    no route words) > other. Questions about the ground underfoot are 'other' — the
+    surface is the answer, not a route verdict. '' is describe.
+    """
+    q = (question or "").strip()
+    if not q:
+        return "describe"
+    if DISTANCE_RE.search(q):
+        return "distance"
+    if count_subject(q):
+        return "count"
+    if NAVIGATION_RE.search(q):
+        return "path"
+    if flow in ("B", "C"):
+        return "find"
+    if SURFACE_Q_RE.search(q):
+        return "other"
+    if navigation:
+        return "path"
+    return "other"
+
+
+def _is_plural(name: str) -> bool:
+    words = (name or "").strip().lower().split()
+    while len(words) > 1 and words[-1] in POSITION_TAIL_WORDS:
+        words.pop()
+    w = words[-1] if words else ""
+    return (w.endswith("s") and not w.endswith(("ss", "us", "is"))) \
+        or w in {"people", "feet", "children"}
+
+
+def _where(clock: Any, size: str) -> str:
+    return f"{clock} o'clock, {DIST_PHRASE.get(size, size or 'ahead')}"
+
+
+def _path_opening(a: dict[str, Any]) -> list[str]:
+    """Lead for a route question: the verdict, each object once.
+
+    'Careful —' only for a rule-2 obstruction on the route (rule 3);
+    the goal is named once, after the obstruction."""
+    desc = str(a.get("goal_desc") or "exit")
+    if a["verdict"] == "no_goal_visible":
+        return [f"I can't see the {desc} in this photo."]
+    # One mention per object: entries sharing a head noun (two ice
+    # boxes SAM did not merge) are one obstacle, at every clock cited.
+    groups: dict[str, dict[str, Any]] = {}
+    for o in a["on_path"]:
+        g = groups.setdefault(_head_noun(o["name"]), {
+            "name": o["name"], "clocks": [], "size_class": o["size_class"]})
+        if _is_plural(o["name"]) and not _is_plural(g["name"]):
+            g["name"] = o["name"]
+        if o["clock"] not in g["clocks"]:
+            g["clocks"].append(o["clock"])
+    obs = [dict(g, clock=" and ".join(str(c) for c in g["clocks"]))
+           for g in list(groups.values())[:2]]
+    goal_where = (_where(a["goal_clock"], a.get("goal_size") or "")
+                  if a.get("goal") else "")
+    way = "the way through the" if a.get("through") else "the way to the"
+    if a["verdict"] == "clear":
+        if goal_where:
+            return [f"Yes — {way} {desc} is clear, at your "
+                    f"{goal_where}."]
+        return ["Yes — the way ahead is clear."]
+    if len(obs) == 1:
+        o = obs[0]
+        verb = "are" if _is_plural(o["name"]) else "is"
+        lead = (f"Careful — {o['name']} {verb} in your path at "
+                f"{_where(o['clock'], o['size_class'])}.")
+    else:
+        parts = ", and ".join(
+            f"{o['name']} at {_where(o['clock'], o['size_class'])}"
+            for o in obs)
+        lead = f"Careful — {parts}, are in your path."
+    out = [lead]
+    if goal_where and a.get("through"):
+        out.append(f"The way through the {desc} is at your {goal_where}.")
+    elif goal_where:
+        verb = "are" if _is_plural(desc) else "is"
+        out.append(f"The {desc} {verb} at your {goal_where}.")
+    return out
+
+
+def _distance_opening(a: dict[str, Any], question: str) -> list[str]:
+    """Lead for 'how far': the distance first, then where (rule 3). A
+    true obstruction between the user and the referent follows — said
+    plainly, not as a walking-hazard lead."""
+    desc = str(a.get("goal_desc") or "")
+    if a["verdict"] == "no_goal_visible":
+        return [f"I can't see the {desc} in this photo."]
+    if not a.get("goal"):
+        return []
+    plural = _is_plural(desc) or _is_plural(str(a["goal"]))
+    used_pronoun = bool(set(re.findall(r"[a-z]+", question.lower()))
+                        & PRONOUN_WORDS)
+    subj = ("They" if plural else "It") if used_pronoun else f"The {desc}"
+    verb = "are" if plural else "is"
+    dist = DIST_PHRASE.get(a.get("goal_size") or "", a.get("goal_size"))
+    out = [f"{subj} {verb} {dist}, at your {a['goal_clock']} o'clock."]
+    for o in a["on_path"][:1]:
+        ov = "are" if _is_plural(o["name"]) else "is"
+        out.append(f"On the way, {o['name']} {ov} at your "
+                   f"{_where(o['clock'], o['size_class'])}.")
+    return out
+
+
+def _mention_heads(text: str, heads: set[str]) -> set[str]:
+    tl = text.lower()
+    return {h for h in heads
+            if re.search(r"\b" + re.escape(h) + r"(?:s|es)?\b", tl)}
+
+
+def _tidy(
+    opening: list[str],
+    body: str,
+    kind: str,
+    scene: list[dict[str, Any]],
+    assessment: dict[str, Any] | None,
+    hazards: list[str],
+    question: str,
+    count_words: set[str] | None = None,
+) -> str:
+    """Rule 4 — make the draft right before synthesis, deterministically.
+
+    The opening (code-written lead, or Spark's own first sentence when
+    there is none) always stands. Each later sentence is dropped when:
+    it re-locates an already-located object (or a pronoun) at an
+    already-stated clock and relates it to nothing new; it is only about the ground and says
+    nothing about footing (unless the question asks about the ground);
+    or, after a code-written opening, it is a second orientation
+    landmark or past the body budget; for a count, it mentions the
+    counted noun again (the code-written count is the only count).
+    Warning/caution sentences always stay.
+    """
+    sents = split_sentences(body)
+    if not opening:
+        opening, sents = sents[:1], sents[1:]
+    heads = {_head_noun(str(e.get("name", ""))) for e in scene} - {""}
+    if assessment and assessment.get("goal_desc"):
+        heads.add(_head_noun(str(assessment["goal_desc"])))
+    ground = {h for h in heads if h in GROUND_WORDS}
+    key = set(hazards)
+    if assessment:
+        key |= {_head_noun(str(o["name"])) for o in assessment["on_path"]}
+        key.add(_head_noun(str(assessment.get("goal") or "")))
+        key.add(_head_noun(str(assessment.get("goal_desc") or "")))
+    surface_question = bool(SURFACE_Q_RE.search(question or ""))
+    coded = kind in ("path", "distance", "count")
+    counted = [re.compile(r"\b" + re.escape(w) + r"(?:e?s)?\b", re.IGNORECASE)
+               for w in (count_words or set())]
+    stated: dict[str, set[str]] = {}
+
+    said_clocks: set[str] = set()
+
+    def note(s: str) -> None:
+        said_clocks.update(_clock_set(s))
+        for h in _mention_heads(s, heads):
+            stated.setdefault(h, set()).update(_clock_set(s) or {""})
+
+    for s in opening:
+        note(s)
+    kept: list[str] = []
+    body_count = orientation = 0
+    for s in sents:
+        t = s.strip()
+        if t.lower().startswith("warning:") or CAUTION_RE.search(t):
+            kept.append(t)
+            note(t)
+            continue
+        if any(rx.search(t) for rx in counted):
+            continue  # a second count, or the counted things re-listed
+        hs = _mention_heads(t, heads)
+        clocks = _clock_set(t)
+        if clocks and not RELATION_RE.search(t) and (
+                all(clocks <= stated.get(h, set()) for h in hs) if hs
+                # Pronoun subject ("They are at your 12 o'clock"): a
+                # restatement when every clock it cites is already said.
+                else PRONOUN_LEAD_RE.match(t) and clocks <= said_clocks):
+            continue  # restatement
+        if hs and hs <= ground and not FOOTING_RE.search(t) \
+                and not surface_question:
+            continue  # ground mention with no footing information
+        if coded:
+            if body_count >= BODY_MAX_SENTENCES:
+                continue
+            if hs and not (hs & key):
+                if orientation >= ORIENTATION_MAX:
+                    continue
+                orientation += 1
+            body_count += 1
+        kept.append(t)
+        note(t)
+    return " ".join([s.strip() for s in opening] + kept).strip()
 
 
 def _hazards_in(scene: list[dict[str, Any]]) -> list[str]:
@@ -1841,18 +2898,21 @@ def synthesize_answer(
 ) -> tuple[str, bool, int]:
     """Final synthesis: distill the draft to the answer contract.
 
-    Returns (text, applied, latency_ms). Describe-mode (no question) and
-    drafts already within the contract shape (< 4 sentences) skip
-    synthesis — a subtractive pass needs something to subtract, and
-    short drafts can only lose facts (case_13 Q1). Any model failure,
-    timeout, or preservation-check failure ships the draft unchanged —
-    fail toward completeness, never toward silence.
+    Returns (text, applied, latency_ms). Skips are contract, not
+    failure: the kill switch (configuration), describe-mode (no
+    question), and drafts with fewer than 4 subtractable (non-locked)
+    sentences — a subtractive pass needs something to subtract, and
+    short drafts can only lose facts (case_13 Q1). Otherwise the stage
+    must run: model failure, timeout, or preservation-check failure
+    retries once with a fresh budget, then raises StageFailed. The
+    unsynthesized draft is never shipped in its place (failure rule,
+    2026-10-27).
     """
     if not synthesis_enabled() or not (question or "").strip():
         return draft, False, 0
-    if len(split_sentences(draft)) < 4:
-        return draft, False, 0
     locked = _locked_sentences(draft)
+    if len(split_sentences(draft)) - len(locked) < 4:
+        return draft, False, 0
     subjects = _question_subjects(question, draft)
     goal_head = _head_noun(str((assessment or {}).get("goal") or ""))
     scene_heads = sorted({_head_noun(str(e.get("name", "")))
@@ -1882,26 +2942,31 @@ def synthesize_answer(
         + "".join(f"LOCKED: {s}\n" for s in locked)
         + f"DRAFT: {draft.strip()}"
     )
+    lead = split_sentences(draft)[0].strip() if draft.strip() else ""
     t0 = time.time()
-    try:
+
+    def ok(text: str) -> bool:
+        # Rule 3 holds through the polish: the draft's lead stays first.
+        return _synthesis_ok(
+            draft, text, locked, hazards, goal_head or None, subjects,
+            scene_heads, landmark_heads,
+        ) and re.sub(r"\s+", " ", text.strip()).startswith(
+            re.sub(r"\s+", " ", lead))
+
+    def attempt() -> str:
         out = _text_complete(
             SYNTHESIS_MODEL, prompt, SYNTHESIS_TIMEOUT
         ).strip().strip("'\"").strip()
-    except Exception:
-        return draft, False, int((time.time() - t0) * 1000)
-    ms = int((time.time() - t0) * 1000)
-    if _synthesis_ok(draft, out, locked, hazards,
-                     goal_head or None, subjects, scene_heads,
-                     landmark_heads):
-        return out, True, ms
-    # One repair attempt for mojibake: the fixed text must still pass the
-    # full check, else the draft ships.
-    fixed = _demojibake(out)
-    if fixed is not None and fixed != out and _synthesis_ok(
-            draft, fixed, locked, hazards, goal_head or None,
-            subjects, scene_heads, landmark_heads):
-        return fixed, True, ms
-    return draft, False, ms
+        if ok(out):
+            return out
+        # Mojibake repair ("â.." for "—"); the fixed text must pass too.
+        fixed = _demojibake(out)
+        if fixed is not None and ok(fixed):
+            return fixed
+        raise _BadOutput(f"synthesis failed preservation: {out[:80]!r}")
+
+    out = _run_stage("synthesis", attempt)
+    return out, True, int((time.time() - t0) * 1000)
 
 
 def run_ask(
@@ -1909,8 +2974,11 @@ def run_ask(
     question: str,
     media_bytes: bytes | None = None,
     audio_bytes: bytes | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Full pipeline: question -> route -> perceive -> gate -> answer."""
+    """Full pipeline: question -> route -> perceive -> gate -> answer.
+    trace, when given, receives what the response does not carry (the
+    full uncollapsed scene) for the dev capture store."""
     t0 = time.time()
     question = (question or "").strip()
     # Part A — precedence: text -> audio transcript -> clip transcript.
@@ -1918,11 +2986,11 @@ def run_ask(
     question_source = "text" if question else "none"
     if not question and audio_enabled():
         if audio_bytes:
-            t = transcribe_audio(to_wav_16k_mono(audio_bytes))
+            t = transcribe_question(audio_bytes)
             if t:
                 question, question_source = t, "audio"
         if not question and media_bytes:
-            t = transcribe_audio(to_wav_16k_mono(media_bytes))
+            t = transcribe_question(media_bytes)
             if t:
                 question, question_source = t, "clip"
     question_used: str | None = question or None
@@ -1934,6 +3002,7 @@ def run_ask(
     sam_prompt = target or ""
     if flow == "B":
         sam_prompt, qualifier = split_qualifier(target or "")
+        qualifier = qualifier or clause_qualifier(question)
 
     match: dict[str, Any] | None = None
     none_count = 0
@@ -1947,11 +3016,14 @@ def run_ask(
     # Answer tightening — merge duplicate instances before anything
     # consumes the scene (gate state, answer context, chips, eval).
     scene = merge_entries(scene)
+    # A count question segments its noun, so every instance is counted
+    # — across the clip's frames when the ask came with one.
+    scene = count_look(image, scene, question, media_bytes)
     if flow == "C" and match is not None:
         match = next((e for e in scene if e.get("match")), None)
 
     ask_id = uuid.uuid4().hex
-    result, floor_ran = _compose(
+    result, floor_ran, referent, full_scene = _compose(
         image, scene, question, question_source, question_used,
         flow, target, sam_prompt, qualifier, match, luminance, p85,
         t0, none_count, ask_id=ask_id,
@@ -1960,8 +3032,10 @@ def run_ask(
         "created": time.time(),
         # The composed scene: floor finds joined inside _compose, so the
         # stored scene must come from the result, not the pre-look local.
+        # Every instance (not the collapsed chips); the clip for counts.
         "image": image,
-        "scene": result.get("scene_model", scene),
+        "media": media_bytes,
+        "scene": full_scene,
         "flow": flow,
         "target": target,
         "question": question_used,
@@ -1969,7 +3043,11 @@ def run_ask(
         "behavior": result.get("behavior"),
         "floor_done": floor_ran,
         "read_targets": [resolve_target(question)] if flow == "C" else [],
+        "referent": referent,
     })
+    if trace is not None:
+        trace.update({"ask_id": ask_id, "scene_full": full_scene,
+                      "referent": referent})
     return result
 
 
@@ -1992,15 +3070,19 @@ def _compose(
     ask_id: str = "",
     followup: bool = False,
     allow_floor_look: bool = True,
-) -> tuple[dict[str, Any], bool]:
+    prior_referent: str = "",
+) -> tuple[dict[str, Any], bool, str, list[dict[str, Any]]]:
     """Shared tail: gate -> answer -> post-process -> synthesize -> log.
 
     Fresh asks and follow-ups differ only in perception (full vs cached
     + conditional); everything from the intent gate on runs here,
     identically. Follow-ups add prior Q/A context for reference
     resolution. allow_floor_look=False skips the floor second look
-    (follow-ups whose media already had it). Returns (result,
-    floor_ran) so callers can record perception state in the cache.
+    (follow-ups whose media already had it). prior_referent is the
+    previous ask's subject, which a pronoun resolves to. Returns
+    (result, floor_ran, referent, scene) so callers can record perception
+    state, the subject, and the full scene (every instance — the shipped
+    scene_model is collapsed for display) in the cache.
     """
     # Fix 1 + Patch 1 — intent gate: regex layer 1 + Jev layer 2.
     jev = jev_intents(jev_state(scene, question, flow, target))
@@ -2011,12 +3093,13 @@ def _compose(
         jev is not None
         and jev.get("navigation_intent", 0) >= JEV_THRESHOLD_NAVIGATION
     )
+    kind = question_kind(question, flow, navigation)
 
     # Field test §1 — floor second look for navigation asks (not in the
     # dark: nothing to see). Finds join the scene before assessment, so
     # the path verdict accounts for small floor hazards.
     floor_found, floor_ran = 0, False
-    if navigation and not (crossing_like or dosing) \
+    if kind == "path" and not (crossing_like or dosing) \
             and allow_floor_look and floor_look_enabled() \
             and p85 >= DARK_P85:
         floor_new = floor_look(image, scene)
@@ -2059,7 +3142,9 @@ def _compose(
         extra += (f" The user is looking for '{sam_prompt}' with qualifier "
                   f"'{qualifier}' (for example a labeled number): use the "
                   f"photo and the scene positions to identify which "
-                  f"instance matches.")
+                  f"instance matches, and say where it sits within its "
+                  f"group (for example: 'the right-hand column, second "
+                  f"from the bottom', or 'just above the parcel locker').")
     if crossing_like:
         extra += (
             " SAFETY: this is a street-crossing decision. NEVER tell the "
@@ -2080,50 +3165,76 @@ def _compose(
             "cross, proceed, or wait, and never state whether it is safe "
             "to move."
         )
-    if HOW_MANY_RE.search(question):
-        # Patch 5 — counting assist (experimental).
-        extra += (
-            " Count carefully from the photo and the scene model. Each "
-            "scene entry has a size_class: an instance much smaller than "
-            "the largest is a partial or edge instance — describe it as "
-            "such (for example: 'three full banks and part of a fourth'), "
-            "and say how many full instances there are."
-        )
     if hazards and not (crossing_like or dosing):
         extra += (
             " SAFETY: these hazards are present and you MUST name each as "
             f"a warning in the answer: {', '.join(hazards)}."
         )
+    # Rules 1-3: the goal is what the question names, obstructions are
+    # rule-2 floor objects, and the lead answers the question asked —
+    # written here, from computed facts, so Spark only adds detail.
     nav_assessment: dict[str, Any] | None = None
-    if navigation and not (crossing_like or dosing):
+    opening: list[str] = []
+    referent = prior_referent
+    if flow == "C":
+        referent = (str(match.get("name", "")) if match
+                    else resolve_target(question))
+    elif flow == "B" and sam_prompt:
+        referent = sam_prompt
+    if kind in ("path", "distance") and not (crossing_like or dosing):
+        with Image.open(io.BytesIO(image)) as im:
+            img_w, img_h = im.size
         assessment = _path_assessment(
-            scene, question, height=_image_height(image))
+            scene, question, height=img_h, hint=prior_referent,
+            width=img_w,
+            openings=passage_look(image, scene, question, prior_referent))
         nav_assessment = assessment
-        if assessment["verdict"] == "no_goal_visible":
-            desc = str(assessment.get("goal_desc") or "exit")
-            extra += (
-                " NAVIGATION: this is a path question but the goal is not "
-                f"visible in this photo: say the {desc} is not visible in "
-                "this photo and never invent one. Mention visible items "
-                "only briefly as orientation landmarks."
-            )
-        else:
-            goal_txt = assessment["goal"] or "the way ahead"
+        if assessment["goal"] or assessment["verdict"] == "no_goal_visible":
+            referent = str(assessment["goal_desc"])
+        if kind == "path":
+            opening = _path_opening(assessment)
+            if assessment["verdict"] == "clear" and p85 < DARK_P85:
+                # Nothing certified a clear path in the dark (the floor
+                # look does not run there): say so instead of "Yes —".
+                opening = ["It's too dark for me to tell whether the way "
+                           "ahead is clear."]
             obs = "; ".join(
                 f"{o['name']} at {o['clock']} o'clock, {o['size_class']}"
-                for o in assessment["on_path"]
-            ) or "none"
+                for o in assessment["on_path"]) or "none"
             extra += (
-                " NAVIGATION: this is a path question. Facts: goal "
-                f"{goal_txt} at {assessment['goal_clock']} o'clock; "
-                f"verdict {assessment['verdict']}; on-path obstacles: "
-                f"{obs}. You MUST (a) lead with the verdict sentence: "
-                "'Yes — the way to the goal is clear.' if clear, or "
-                "'Careful — <obstacle> is in your path at <clock> "
-                "o'clock.' if blocked; (b) name on-path obstacles with "
-                "clock-face direction and distance; (c) mention off-path "
-                "items only briefly as orientation landmarks."
+                " NAVIGATION: this is a route question. Facts: goal "
+                f"{assessment['goal'] or 'the way ahead'}; verdict "
+                f"{assessment['verdict']}; on-path obstacles: {obs}. "
+                "Ground you walk on (floor, patio, lawn, sidewalk) and "
+                "things resting on tables or counters are never "
+                "obstacles."
             )
+        else:
+            opening = _distance_opening(assessment, question)
+            if not opening:
+                extra += (" DISTANCE: lead with how far away the thing "
+                          "asked about is, then where it is.")
+    count_words: set[str] = set()
+    if kind == "count" and not (crossing_like or dosing):
+        subject = count_subject(question) or ""
+        with Image.open(io.BytesIO(image)) as im:
+            width, height = im.size
+        opening = _count_opening(scene, subject, width, height)
+        words = subject.split()
+        count_words = {_singular(w) for w in words[-2:]}
+        referent = " ".join(words[:-1] + [_singular(words[-1])])
+        extra += (" COUNT: the count in the opening is final, taken from "
+                  "the scene; never state a number of them yourself.")
+    if opening:
+        extra += (
+            " OPENING: the answer begins with these sentences, already "
+            f"written and spoken first: \"{' '.join(opening)}\" Do not "
+            "repeat them and do not mention again any object they name. "
+            "Add at most two short sentences, only with what matters for "
+            "this question: footing (wet, uneven, a step or a change of "
+            "surface — never color or material) or one orientation "
+            "landmark. If nothing more matters, the answer is empty."
+        )
     if flow == "C" and match is None:
         extra += (
             " The requested item cannot be confirmed from any readable "
@@ -2149,8 +3260,12 @@ def _compose(
         desc = f"I see {', '.join(seen[:5])}. " if seen else ""
         answer, confidence = f"{desc}{CONSUMPTION_TEMPLATE}", 0.4
     else:
-        answer, confidence = _spark_answer(
-            image, question, scene, flow, extra, landmarks)
+        body, confidence = _run_stage("answer", lambda: _spark_answer(
+            image, question, scene, flow, extra, landmarks,
+            allow_empty=bool(opening)))
+        # Rule 4: the draft is right before synthesis ever sees it.
+        answer = _tidy(opening, body, kind, scene, nav_assessment,
+                       hazards, question, count_words)
 
     if crossing_like or dosing:
         behavior = "ESCALATE"
@@ -2189,7 +3304,15 @@ def _compose(
             label = str(match.get("label", "")).strip()
             if (label and label.upper() != "NONE"
                     and label.lower() not in answer.lower()):
-                answer = f"Found your {label.title()}. {answer}"
+                # Replace Spark's own bare "Found your ADHD medicine."
+                # rather than stacking two found-sentences.
+                parts = split_sentences(answer)
+                if parts and re.fullmatch(
+                        r"(?:i\s+)?found\s+(?:it|your\s[^.!]*)[.!]?",
+                        parts[0].strip(), re.IGNORECASE):
+                    parts = parts[1:]
+                answer = " ".join(
+                    [f"Found your {label.title()}."] + parts)
         if street_scene:
             # Fix 3 — strip directive sentences, deterministically.
             kept = [s for s in split_sentences(answer)
@@ -2210,14 +3333,18 @@ def _compose(
     # The synthesized text is the single final text: spoken, displayed,
     # stored. Hedge/caution/warning sentences are locked verbatim, so the
     # deterministic appends above survive; describe-mode skips inside.
-    answer, synth_applied, synth_ms = synthesize_answer(
-        answer, question, scene, nav_assessment, hazards, landmarks)
+    # Escalations skip it: a polish pass (and its failure) must never
+    # stand between the user and the volunteer handoff.
+    synth_applied, synth_ms = False, 0
+    if behavior != "ESCALATE":
+        answer, synth_applied, synth_ms = synthesize_answer(
+            answer, question, scene, nav_assessment, hazards, landmarks)
 
     result = {
         "answer": answer,
         "behavior": behavior,
         "confidence": round(float(confidence), 3),
-        "scene_model": scene,
+        "scene_model": ship_scene(scene),
         "flow": flow,
         "gate": gate,
         "signals": {"mean_luminance": round(luminance, 2),
@@ -2229,16 +3356,22 @@ def _compose(
     }
     # Part C — one log line per ask (question text is the user's own
     # words to their own server; keys never appear here).
-    seen: list[str] = []
+    # Instances per name ("tortoiseshell cat x2"): a deduplicated list
+    # hid how many entries the scene held.
+    tally: dict[str, int] = {}
     for e in scene:
         n = str(e.get("name", "")).strip()
-        if n and n.lower() not in [x.lower() for x in seen]:
-            seen.append(n)
+        if n:
+            tally[n] = tally.get(n, 0) + 1
+    seen = [n if c == 1 else f"{n} x{c}" for n, c in tally.items()]
     print(json.dumps({
         "ts": datetime.now(timezone.utc).isoformat(),
         "question": question_used,
         "question_source": question_source,
         "flow": flow,
+        "kind": kind,
+        "verdict": (nav_assessment or {}).get("verdict"),
+        "passage": (nav_assessment or {}).get("passage_source"),
         "behavior": behavior,
         "gate": gate,
         "scene_objects": seen,
@@ -2252,7 +3385,7 @@ def _compose(
         "ask_id": ask_id,
         "followup": followup,
     }), flush=True)
-    return result, floor_ran
+    return result, floor_ran, referent, scene
 
 
 # ----------------------------------------------------------------------------
@@ -2306,6 +3439,7 @@ def run_followup(
     ask_id: str,
     question: str,
     audio_bytes: bytes | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Follow-up on a cached ask: same media, new question.
 
@@ -2323,7 +3457,7 @@ def run_followup(
     question = (question or "").strip()
     question_source = "text" if question else "none"
     if not question and audio_bytes and audio_enabled():
-        t = transcribe_audio(to_wav_16k_mono(audio_bytes))
+        t = transcribe_question(audio_bytes)
         if t:
             question, question_source = t, "audio"
     question_used: str | None = question or None
@@ -2335,6 +3469,7 @@ def run_followup(
     sam_prompt = target or ""
     if flow == "B":
         sam_prompt, qualifier = split_qualifier(target or "")
+        qualifier = qualifier or clause_qualifier(question)
 
     scene = copy.deepcopy(entry["scene"])
     read_targets = list(entry.get("read_targets", []))
@@ -2355,6 +3490,8 @@ def run_followup(
             read_targets.append(want)
         else:
             match = next((e for e in scene if e.get("match")), None)
+    # A count names a noun the cached scene may never have segmented.
+    scene = count_look(image, scene, question, entry.get("media"))
 
     prior_context = ""
     if entry.get("question") and entry.get("answer"):
@@ -2366,19 +3503,21 @@ def run_followup(
     # The floor look the original ask never triggered runs inside
     # _compose when the new question is navigation; allow it unless
     # this media already had it.
-    result, floor_ran_now = _compose(
+    result, floor_ran_now, referent, full_scene = _compose(
         image, scene, question, question_source, question_used,
         flow, target, sam_prompt, qualifier, match, luminance, p85,
         t0, none_count,
         prior_context=prior_context, ask_id=new_id, followup=True,
         allow_floor_look=not floor_done,
+        prior_referent=str(entry.get("referent") or ""),
     )
     floor_done = floor_done or floor_ran_now
     _store_ask(new_id, {
         "created": time.time(),
         # Composed scene (conditional perception joined inside _compose).
         "image": image,
-        "scene": result.get("scene_model", scene),
+        "media": entry.get("media"),
+        "scene": full_scene,
         "flow": flow,
         "target": target,
         "question": question_used,
@@ -2386,5 +3525,9 @@ def run_followup(
         "behavior": result.get("behavior"),
         "floor_done": floor_done,
         "read_targets": read_targets,
+        "referent": referent,
     })
+    if trace is not None:
+        trace.update({"ask_id": new_id, "parent_ask_id": ask_id,
+                      "scene_full": full_scene, "referent": referent})
     return result

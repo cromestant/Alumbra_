@@ -44,8 +44,11 @@ import java.io.FileOutputStream
  * The giant button keeps its WhatsApp-style interaction: tap = photo ask
  * (still + ~4s live-transcribed audio window), press-and-hold = clip ask
  * (video while held, narration transcribed live). Typed text, when
- * non-empty, wins over the transcript. Every state change is haptic +
- * spoken + live-region announced; the screen is fully operable eyes-closed.
+ * non-empty, wins over the transcript. While the mic is live the button
+ * turns red and says so. App voice speaks answers and true state only
+ * (sent/analyzing, errors, escalation); screen and button narration is
+ * status text in a live region, which TalkBack reads — the app does not
+ * narrate its own chrome. The screen is fully operable eyes-closed.
  */
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
@@ -86,12 +89,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var lastAnswer: String? = null
 
     // Follow-up mode: re-ask on the cached ask's media (no camera).
+    // Same gesture as the main screen: hold and talk, release to send;
+    // a tap (or TalkBack activate) opens a timed listen window instead.
     private var followupAskId: String? = null
+    private var followupHolding = false
     // Torch lifecycle: the torch's life is the capture's life.
     private var captureActive = false
     private var lastLux = Float.MAX_VALUE
 
     private val holdRunnable = Runnable { beginClipRecording() }
+    private val followupHoldRunnable = Runnable { beginFollowupHold() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Prefs.applyTheme(this)
@@ -114,10 +121,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         styleAskButton()
 
         tts = AlumbraTts(this)
-        // Dead engine: announce() still sets the visible + live-region
-        // status text (TalkBack speaks it); the speak half no-ops.
+        // Dead engine: the visible + live-region status text says so
+        // (TalkBack speaks it); app voice cannot.
         tts.onVoiceUnavailable = {
-            runOnUiThread { announce(Spoken.VOICE_UNAVAILABLE) }
+            runOnUiThread { statusOnly(Spoken.VOICE_UNAVAILABLE) }
         }
         api = AskApi(Prefs.baseUrl(this))
         sensorManager =
@@ -135,8 +142,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         recordButton.setOnTouchListener { view, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    // Follow-up mode: no hold-to-record — tap speaks.
-                    if (followupAskId == null) {
+                    if (followupAskId != null) {
+                        recordButton.postDelayed(
+                            followupHoldRunnable, HOLD_THRESHOLD_MS
+                        )
+                    } else {
                         ensurePermissions {
                             recordButton.postDelayed(
                                 holdRunnable, HOLD_THRESHOLD_MS
@@ -147,8 +157,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     recordButton.removeCallbacks(holdRunnable)
+                    recordButton.removeCallbacks(followupHoldRunnable)
                     if (followupAskId != null) {
-                        doFollowupAsk()
+                        if (followupHolding) endFollowupHold()
+                        else doFollowupAsk()
                     } else if (clipRecording != null) {
                         finishClipAsk()
                     } else {
@@ -166,7 +178,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             api.cancel()
             endCapture()
             hideWorking()
-            announce(Spoken.CANCELLED)
+            statusOnly(Spoken.CANCELLED)
             Haptics.pulse(this)
         }
         replayButton.setOnClickListener {
@@ -175,14 +187,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 Haptics.pulse(this)
                 tts.speak(answer)
             } else {
-                announce(Spoken.NO_ANSWER)
+                statusOnly(Spoken.NO_ANSWER)
             }
         }
         torchButton.setOnClickListener {
             manualTorch = true
             setTorch(!torchOn)
             Haptics.pulse(this)
-            announce(if (torchOn) Spoken.TORCH_ON else Spoken.TORCH_OFF)
+            statusOnly(if (torchOn) Spoken.TORCH_ON else Spoken.TORCH_OFF)
         }
         findViewById<Button>(R.id.history_button).setOnClickListener {
             startActivity(Intent(this, HistoryActivity::class.java))
@@ -191,20 +203,44 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
+        findViewById<Button>(R.id.followup_exit_button).setOnClickListener {
+            Haptics.pulse(this)
+            goToFreshAsk()
+        }
+
         followupAskId = intent.getStringExtra(EXTRA_FOLLOWUP_ASK_ID)
         if (followupAskId != null) {
+            // No camera in follow-up mode: the cached ask's media is used.
+            val prior = intent.getStringExtra(EXTRA_FOLLOWUP_QUESTION)
             styleFollowupButton()
-            if (savedInstanceState == null) {
-                announce(Spoken.FOLLOWUP_IDLE)
-            } else {
-                statusText.text = Spoken.FOLLOWUP_IDLE
-            }
+            findViewById<LinearLayout>(R.id.followup_panel).visibility =
+                LinearLayout.VISIBLE
+            findViewById<TextView>(R.id.followup_question_text).text =
+                prior?.takeUnless { it.isBlank() } ?: "your last answer"
+            recordButton.contentDescription =
+                getString(R.string.followup_button_description)
+            statusOnly(Spoken.followupIntro(prior))
         } else {
+            if (savedInstanceState == null &&
+                intent.getBooleanExtra(EXTRA_NEW_QUESTION, false)
+            ) {
+                statusOnly(Spoken.BACK_TO_ASK)
+            }
             ensurePermissions {
                 bindCamera()
                 runProbeOnce()
             }
         }
+    }
+
+    /** Arriving back from an Answer ("New question" / Back). */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        // A new question starts empty: a typed question left from the
+        // last ask would otherwise be resent silently.
+        typeField.setText("")
+        if (followupAskId == null) statusOnly(Spoken.BACK_TO_ASK)
     }
 
     override fun onResume() {
@@ -226,6 +262,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onDestroy() {
         recordButton.removeCallbacks(holdRunnable)
+        recordButton.removeCallbacks(followupHoldRunnable)
         handler.removeCallbacksAndMessages(null)
         recognizer?.destroy()
         api.cancel()
@@ -302,7 +339,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (needed.isEmpty()) {
             onGranted()
         } else {
-            announce(
+            statusOnly(
                 if (needsLanPermission()) {
                     Spoken.PERMISSIONS_NEEDED_LAN
                 } else {
@@ -326,7 +363,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 it == PackageManager.PERMISSION_GRANTED
             }
         ) {
-            announce(Spoken.ASK_LIVE_IDLE)
+            statusOnly(Spoken.ASK_LIVE_IDLE)
             bindCamera()
             runProbeOnce()
         } else {
@@ -461,6 +498,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         Haptics.pulse(this@MainActivity)
                         Earcons.shutter()
                         statusOnly(Spoken.PHOTO_TAKEN)
+                        showMicLive(hold = false)
                         listenThenSend(photoFile = file)
                     }
 
@@ -485,6 +523,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             transcriptArrived = true
             pendingTranscript = transcript
             tts.micHot = false
+            showMicIdle()
             sendPhotoAsk(photoFile, transcript)
         }
         recognizer?.start()
@@ -499,13 +538,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun sendPhotoAsk(photoFile: File, transcript: String) {
         val typed = typeField.text.toString().trim()
         val question = typed.ifEmpty { transcript }.ifEmpty { null }
-        // Voice path confirms what was heard before sending; typed wins.
-        val heard = if (typed.isBlank() && transcript.isNotBlank()) {
-            Spoken.iHeard(transcript) + " "
-        } else {
-            ""
-        }
-        showWorking(heard + Spoken.PHOTO_SENT, Spoken.workingSub(false))
+        // No "I heard" echo: the question is shown on the Answer screen
+        // and in History, never read back.
+        showWorking(Spoken.PHOTO_SENT, Spoken.workingSub(false))
         // No raw-audio file for photo asks: SpeechRecognizer owns the mic
         // during the window, and concurrent capture is unreliable.
         api.ask(photoFile, question, audio = null, media = null) {
@@ -563,6 +598,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     }
                 Haptics.pulse(this)
                 Earcons.start()
+                showMicLive(hold = true)
                 statusOnly(Spoken.RECORDING_START)
                 recognizer = QuestionRecognizer(this) { transcript ->
                     transcriptArrived = true
@@ -573,6 +609,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             } catch (e: Exception) {
                 clipRecording = null
                 tts.micHot = false
+                showMicIdle()
                 endCapture()
                 Log.e("Alumbra", "clip recording failed", e)
                 announce(Spoken.RECORDING_FAILED)
@@ -589,6 +626,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         recognizer?.stop()
         // Mic closed: stop cue now, speech safe from here on.
         tts.micHot = false
+        showMicIdle()
         // Clip in hand: the torch goes out before Working settles.
         endCapture()
         Haptics.pulse(this)
@@ -700,7 +738,51 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
     }
 
-    private fun styleRecordButton(bigRes: Int, smallRes: Int) {
+    /** Mic live: red button, its label says so for the whole capture. */
+    private fun showMicLive(hold: Boolean) {
+        recordButton.setBackgroundResource(R.drawable.ask_button_recording)
+        recordButton.setTextColor(
+            ContextCompat.getColor(this, R.color.alumbra_rec_ink)
+        )
+        if (hold) {
+            styleRecordButton(
+                R.string.recording_button_big,
+                R.string.recording_button_small, REC_SMALL_INK,
+            )
+        } else {
+            styleRecordButton(
+                R.string.listening_button_big,
+                R.string.listening_button_small, REC_SMALL_INK,
+            )
+        }
+        recordButton.contentDescription = getString(
+            if (hold) R.string.recording_button_description
+            else R.string.listening_button_description
+        )
+    }
+
+    /** Mic closed: back to the Ask (or follow-up) button. */
+    private fun showMicIdle() {
+        recordButton.setBackgroundResource(R.drawable.ask_button)
+        recordButton.setTextColor(
+            ContextCompat.getColor(this, R.color.alumbra_amber_ink)
+        )
+        if (followupAskId != null) {
+            styleFollowupButton()
+            recordButton.contentDescription =
+                getString(R.string.followup_button_description)
+        } else {
+            styleAskButton()
+            recordButton.contentDescription =
+                getString(R.string.record_button_description)
+        }
+    }
+
+    private fun styleRecordButton(
+        bigRes: Int,
+        smallRes: Int,
+        smallInk: Int = IDLE_SMALL_INK,
+    ) {
         val big = getString(bigRes)
         val small = getString(smallRes)
         val text = "$big\n$small"
@@ -720,7 +802,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
         )
         out.setSpan(
-            android.text.style.ForegroundColorSpan(0xBF161200.toInt()),
+            android.text.style.ForegroundColorSpan(smallInk),
             smallStart, text.length,
             android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
         )
@@ -739,12 +821,44 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             sendFollowup(askId, typed)
             return
         }
+        // Tap: a timed listen window (the eyes-free TalkBack path).
+        startFollowupListening()
+        handler.postDelayed({
+            if (!transcriptArrived) {
+                recognizer?.stop()
+                // onError("") arrives and completes the path.
+            }
+        }, FOLLOWUP_LISTEN_MS)
+    }
+
+    /** Hold: listen while the button is held; release sends. */
+    private fun beginFollowupHold() {
+        if (followupAskId == null || sending ||
+            workingOverlay.visibility == LinearLayout.VISIBLE
+        ) {
+            return
+        }
+        if (typeField.text.toString().isNotBlank()) return // tap sends it
+        followupHolding = true
+        startFollowupListening()
+    }
+
+    private fun endFollowupHold() {
+        followupHolding = false
+        showMicIdle()
+        recognizer?.stop()
+        // onResults/onError arrives and completes the path.
+    }
+
+    private fun startFollowupListening() {
+        val askId = followupAskId ?: return
         // Speak the question: recognizer owns the mic, so it runs hot
         // (no app voice into the window) with haptic + cue only.
         tts.stop()
         tts.micHot = true
         Haptics.pulse(this)
         Earcons.start()
+        showMicLive(hold = followupHolding)
         statusOnly(Spoken.FOLLOWUP_LISTENING)
         sending = true
         transcriptArrived = false
@@ -752,6 +866,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             if (transcriptArrived) return@QuestionRecognizer
             transcriptArrived = true
             tts.micHot = false
+            showMicIdle()
             Haptics.pulse(this)
             Earcons.stop()
             if (transcript.isBlank()) {
@@ -762,12 +877,25 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
         }
         recognizer?.start()
-        handler.postDelayed({
-            if (!transcriptArrived) {
-                recognizer?.stop()
-                // onError("") arrives and completes the path.
-            }
-        }, FOLLOWUP_LISTEN_MS)
+    }
+
+    /**
+     * Leave follow-up mode for a fresh ask. CLEAR_TOP cannot be used
+     * here: this screen is itself the topmost MainActivity, so the
+     * intent would come back to it. A fresh task gives a plain Ask
+     * screen with the camera bound; History is persisted, nothing lost.
+     */
+    private fun goToFreshAsk() {
+        tts.stop()
+        recognizer?.destroy()
+        startActivity(
+            Intent(this, MainActivity::class.java)
+                .putExtra(EXTRA_NEW_QUESTION, true)
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TASK
+                )
+        )
     }
 
     private fun sendFollowup(askId: String, question: String) {
@@ -779,11 +907,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * Expired follow-up target: become a plain Ask screen in place (so
+     * the expiry message is not cut off by navigation). Follow-up mode
+     * never bound the camera, so bind it now or the next tap would say
+     * "Camera is not ready yet."
+     */
     private fun exitFollowupMode() {
         followupAskId = null
+        followupHolding = false
         typeField.setText("")
-        styleAskButton()
+        showMicIdle()
         statusText.text = ""
+        findViewById<LinearLayout>(R.id.followup_panel).visibility =
+            LinearLayout.GONE
+        ensurePermissions { bindCamera() }
     }
 
     private fun onAskOutcome(question: String?, outcome: AskOutcome) {
@@ -801,12 +939,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         outcome.result.questionSource,
                     )
                     refreshLastAnswer()
-                    announce(Spoken.ANSWER_ARRIVED)
+                    // The Answer screen speaks the answer itself.
+                    statusOnly(Spoken.ANSWER_ARRIVED)
                     startActivity(
                         Intent(this, AnswerActivity::class.java).putExtra(
                             AnswerActivity.EXTRA_RECORD_ID, record.id
                         )
                     )
+                    // A follow-up screen is spent once answered: Back
+                    // from the new answer must not land on it.
+                    if (followupAskId != null) finish()
                 }
                 is AskOutcome.Err -> {
                     // Expired follow-up target: back to a fresh ask —
@@ -819,7 +961,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         errorDetail = outcome.detail,
                     )
                     announce(
-                        if (outcome.expired) outcome.message
+                        if (outcome.expired || outcome.plain) outcome.message
                         else Spoken.errorDetail(outcome.message)
                     )
                 }
@@ -859,6 +1001,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val CLIP_SETTLE_MS = 10000L
         private const val LAST_ANSWER_CHARS = 120
         private const val DARK_LUX = 10.0f
+        private const val IDLE_SMALL_INK = 0xBF161200.toInt()
+        private const val REC_SMALL_INK = 0xE6FFFFFF.toInt()
         const val EXTRA_FOLLOWUP_ASK_ID = "followup_ask_id"
+        const val EXTRA_FOLLOWUP_QUESTION = "followup_question"
+        const val EXTRA_NEW_QUESTION = "new_question"
     }
 }
