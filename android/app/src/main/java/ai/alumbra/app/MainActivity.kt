@@ -43,7 +43,7 @@ import java.io.FileOutputStream
  *
  * The giant button keeps its WhatsApp-style interaction: tap = photo ask
  * (still + ~4s live-transcribed audio window), press-and-hold = clip ask
- * (video while held, narration transcribed live). Typed text, when
+ * (video while held; the server transcribes the clip's own audio). Typed text, when
  * non-empty, wins over the transcript. While the mic is live the button
  * turns red and says so. App voice speaks answers and true state only
  * (sent/analyzing, errors, escalation); screen and button narration is
@@ -77,7 +77,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var clipFinalized = false
     private var clipError: String? = null
     private var recognizer: QuestionRecognizer? = null
-    private var pendingTranscript: String? = null
     private var transcriptArrived = false
     private var sending = false
 
@@ -517,11 +516,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun listenThenSend(photoFile: File) {
         sending = true
         transcriptArrived = false
-        pendingTranscript = null
         recognizer = QuestionRecognizer(this) { transcript ->
             if (transcriptArrived) return@QuestionRecognizer
             transcriptArrived = true
-            pendingTranscript = transcript
             tts.micHot = false
             showMicIdle()
             sendPhotoAsk(photoFile, transcript)
@@ -564,8 +561,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             clipFile = File(cacheDir, "ask_${System.currentTimeMillis()}.mp4")
             clipFinalized = false
             clipError = null
-            transcriptArrived = false
-            pendingTranscript = null
             if (ContextCompat.checkSelfPermission(
                     this, Manifest.permission.RECORD_AUDIO
                 ) != PackageManager.PERMISSION_GRANTED
@@ -596,16 +591,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             maybeSendClipAsk()
                         }
                     }
+                // Start cue (and the stop cue on release) are ours. No
+                // live recognizer on clips: it shared the mic with the
+                // recorder, mostly heard nothing, ended on the first pause
+                // with the speech engine's own beep, and a fragment it did
+                // catch would have replaced the full question. The clip's
+                // audio holds everything said while held; the server
+                // transcribes it.
                 Haptics.pulse(this)
                 Earcons.start()
                 showMicLive(hold = true)
                 statusOnly(Spoken.RECORDING_START)
-                recognizer = QuestionRecognizer(this) { transcript ->
-                    transcriptArrived = true
-                    pendingTranscript = transcript
-                    maybeSendClipAsk()
-                }
-                recognizer?.start()
             } catch (e: Exception) {
                 clipRecording = null
                 tts.micHot = false
@@ -623,7 +619,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         } catch (e: Exception) {
         }
         clipRecording = null
-        recognizer?.stop()
         // Mic closed: stop cue now, speech safe from here on.
         tts.micHot = false
         showMicIdle()
@@ -632,19 +627,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         Haptics.pulse(this)
         Earcons.stop()
         showWorking(Spoken.CLIP_SENT, Spoken.workingSub(true))
-        // maybeSendClipAsk fires when finalize + transcript both land.
+        // maybeSendClipAsk fires when the recorder finalizes the file.
         handler.postDelayed({
             if (sending) return@postDelayed
-            if (!clipFinalized || !transcriptArrived) {
+            if (!clipFinalized) {
                 clipFinalized = true
-                transcriptArrived = true
                 maybeSendClipAsk()
             }
         }, CLIP_SETTLE_MS)
     }
 
     private fun maybeSendClipAsk() {
-        if (sending || !clipFinalized || !transcriptArrived) return
+        if (sending || !clipFinalized) return
         sending = true
         val error = clipError
         val file = clipFile
@@ -661,8 +655,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             return
         }
         val typed = typeField.text.toString().trim()
-        val question = typed.ifEmpty { pendingTranscript.orEmpty() }
-            .ifEmpty { null }
+        // Typed text wins; otherwise the server transcribes the clip.
+        val question = typed.ifEmpty { null }
         Thread {
             val frame = extractMiddleFrame(file)
             runOnUiThread {
