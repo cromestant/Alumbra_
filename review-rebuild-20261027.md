@@ -792,3 +792,14 @@ Replaying the same clip in-process:
 - Fix: reads now run in one wave (a worker per crop, at most 8) with a 10 s grace. The same clip then took 31.6–42.8 s over five runs.
 - One of those runs missed the scratcher. Naming didn't list it, and the floor look read it as bare "ramp", which is passable. Floor-look finds now carry `floor_find`, and `_not_obstruction` never treats them as passage.
 - Offline: 283 checks pass with no failures.
+
+#### Clip latency, second pass (Oct 29, 16:00)
+
+The field clip at 15:48 took 48 s server-side. Replayed, the stages were: ASR 1.9 s, naming 5–10 s, SAM 5 s, floor look 11 s (within its grace), final answer 16–20 s on Spark.
+
+- **Coded-lead answers race Baseten.** `_race_read` is generalized out of `_floor_read`. When the lead is code-written (`allow_empty`), Spark's answer is used if it lands within 10 s, otherwise Baseten's (15 s budget, 60 s deadline). Find and other answers stay Spark-only, medicine labels included.
+  - Eval 20261029-155303: 24/27 (only the known three), median 23.0 s, 0 errors, 0 429s.
+- **Naming starts during transcription.** When the question is spoken (audio or clip), `name_scene` runs while ASR does; flow A uses its nouns, and B/C discard them.
+  - The floor-look overlap was skipped: its SAM is 1.3 s, and the reads are the cost.
+- The same clip now takes 27.8–32.0 s over three runs (it was 48 s).
+- Offline: 287 checks pass with no failures.

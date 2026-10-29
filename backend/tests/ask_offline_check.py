@@ -1651,6 +1651,51 @@ check("floor find read as bare 'ramp' is an object; a named ramp passes",
                                       720, 1280), None, [], [], 1280)),
       ("", "passage"))
 
+# Coded-lead answers race Baseten (2026-10-29); find answers stay Spark.
+_rb, _rv, _rs = p._baseten_complete, p._vlm_text, p._load_secret
+_ag = p.ANSWER_SPARK_GRACE_S
+p.ANSWER_SPARK_GRACE_S = 0.2
+p._load_secret = lambda name: "k" if name == "BASETEN_API_KEY" else _rs(name)
+del _os.environ["BASETEN_ENABLED"]
+_who = []
+p._baseten_complete = lambda instr, t, image=None: (
+    _who.append("baseten"), '{"answer": "B.", "confidence": 0.7}')[1]
+p._vlm_text = lambda m, img, instr, t: (
+    _who.append("spark"), _time.sleep(1), '{"answer": "S.", "confidence": 0.9}')[2]
+check("answer, coded lead: Spark late -> Baseten's detail",
+      p._spark_answer(_live_jpeg, "is my path clear", [], "A",
+                      allow_empty=True)[0], "B.")
+_who.clear()
+check("answer, find/other: Spark only, however slow",
+      (p._spark_answer(_live_jpeg, "where's the aspirin", [], "C")[0],
+       "baseten" in _who), ("S.", False))
+p._baseten_complete, p._vlm_text, p._load_secret = _rb, _rv, _rs
+p.ANSWER_SPARK_GRACE_S = _ag
+_os.environ["BASETEN_ENABLED"] = "0"
+
+# Naming starts while a spoken question is transcribed (2026-10-29).
+_rt, _rn, _rfa = p.transcribe_question, p.name_scene, p.flow_a
+_order = []
+p.transcribe_question = lambda m: (_order.append("asr+"), _time.sleep(0.4),
+                                   _order.append("asr-"), "what is here")[3]
+p.name_scene = lambda img: (_order.append("name+"), _time.sleep(0.4),
+                            _order.append("name-"), ["lamp"])[3]
+_got = []
+p.flow_a = lambda img, nouns=None: (_got.append(nouns), [])[1]
+_real_compose = p._compose
+p._compose = lambda *a, **k: ({"answer": "x"}, False, None, [])
+_t0 = _time.time()
+p.run_ask(_live_jpeg, "", b"clip", None, {}, None, None)
+check("naming overlaps transcription; flow A gets the nouns",
+      (_order[:2] in (["asr+", "name+"], ["name+", "asr+"]),
+       _time.time() - _t0 < 0.7, _got), (True, True, [["lamp"]]))
+_order.clear(); _got.clear()
+p.run_ask(_live_jpeg, "what is here", b"clip", None, {}, None, None)
+check("typed question: no speculative naming, flow A names itself",
+      (_order, _got), ([], [None]))
+p.transcribe_question, p.name_scene, p.flow_a = _rt, _rn, _rfa
+p._compose = _real_compose
+
 # App wiring
 from app.main import app
 routes = sorted({r.path for r in app.routes if hasattr(r, "path")})

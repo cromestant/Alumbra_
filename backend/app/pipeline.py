@@ -2438,10 +2438,8 @@ def _count_opening(
 # Flows
 # ----------------------------------------------------------------------------
 
-def flow_a(image: bytes) -> list[dict[str, Any]]:
-    """Open scene: Spark nouns + safety list, one entry per instance."""
-    with Image.open(io.BytesIO(image)) as im:
-        width, height = im.size
+def name_scene(image: bytes) -> list[str]:
+    """Naming stage: Spark's nouns for the image (retry-or-error)."""
     def name_once() -> list[str]:
         raw = _vlm_text(SPARK_MODEL, image, SPARK_NAMING_PROMPT,
                         SPARK_TIMEOUT)
@@ -2450,7 +2448,17 @@ def flow_a(image: bytes) -> list[dict[str, Any]]:
             raise _BadOutput(f"naming returned no array: {raw[:80]!r}")
         return parse_nouns(raw)
 
-    nouns = _run_stage("naming", name_once)
+    return _run_stage("naming", name_once)
+
+
+def flow_a(image: bytes,
+           nouns: list[str] | None = None) -> list[dict[str, Any]]:
+    """Open scene: Spark nouns + safety list, one entry per instance.
+    nouns: already named (started while the question was transcribed)."""
+    with Image.open(io.BytesIO(image)) as im:
+        width, height = im.size
+    if nouns is None:
+        nouns = name_scene(image)
     prompts = list(nouns)
     for s in SAFETY_LIST:
         if s not in prompts:
@@ -2634,30 +2642,52 @@ def _floor_read(crop: bytes) -> str:
     if not baseten_enabled():
         return _run_stage("floor_look", lambda: _within(
             FLOOR_READ_DEADLINE_S, spark))
+    return _race_read(
+        spark,
+        lambda: _baseten_complete(FLOOR_READ_PROMPT,
+                                  FLOOR_READ_BASETEN_TIMEOUT,
+                                  image=crop).strip(),
+        FLOOR_READ_SPARK_GRACE_S, FLOOR_READ_BASETEN_TIMEOUT,
+        FLOOR_READ_DEADLINE_S, "floor_look")
+
+
+# Clip profile 2026-10-29 (after the floor fixes): the coded-lead answer
+# call was the largest stage left, Spark 16-20 s.
+ANSWER_SPARK_GRACE_S = 10
+ANSWER_BASETEN_TIMEOUT = 15
+ANSWER_DEADLINE_S = 60
+
+
+def _race_read(spark: Any, baseten: Any, grace_s: float,
+               baseten_timeout: float, deadline_s: float,
+               stage: str) -> str:
+    """Spark and Baseten at once: Spark's result if it lands within
+    grace_s, else Baseten's; Spark's after all (to deadline_s) when
+    Baseten fails. Both failing raises StageFailed(stage). With Baseten
+    off, Spark alone under the deadline."""
+    if not baseten_enabled():
+        return _within(deadline_s, spark)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     try:
         f_sp = pool.submit(spark)
-        f_bt = pool.submit(lambda: _baseten_complete(
-            FLOOR_READ_PROMPT, FLOOR_READ_BASETEN_TIMEOUT,
-            image=crop).strip())
+        f_bt = pool.submit(baseten)
         errors: list[BaseException] = []
         try:
-            return f_sp.result(timeout=FLOOR_READ_SPARK_GRACE_S)
+            return f_sp.result(timeout=grace_s)
         except concurrent.futures.TimeoutError:
             pass
         except Exception as e:
             errors.append(e)
         try:
-            return f_bt.result(timeout=FLOOR_READ_BASETEN_TIMEOUT)
+            return f_bt.result(timeout=baseten_timeout)
         except Exception as e:
             errors.append(e)
         if not f_sp.done() or f_sp.exception() is None:
             try:
-                return f_sp.result(timeout=max(
-                    0.0, FLOOR_READ_DEADLINE_S - FLOOR_READ_SPARK_GRACE_S))
+                return f_sp.result(timeout=max(0.0, deadline_s - grace_s))
             except Exception as e:
                 errors.append(e)
-        raise StageFailed("floor_look", errors[-1] if errors else None)
+        raise StageFailed(stage, errors[-1] if errors else None)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -2817,13 +2847,21 @@ def _spark_answer(
     allow_empty: bool = False,
 ) -> tuple[str, float]:
     """One composition attempt. allow_empty: the opening is code-written
-    and Spark only adds detail, so "nothing to add" is a valid answer.
+    and Spark only adds detail, so "nothing to add" is a valid answer —
+    and only then does Baseten race Spark (_race_read): the lead, the
+    verdict and every hazard are already the code's. Find/other answers
+    (medicine labels among them) stay Spark's alone.
     Unusable output (no answer, broken JSON) raises for the retry."""
-    raw = _vlm_text(
-        SPARK_MODEL, image,
-        _answer_instruction(question, scene, flow, extra, landmarks),
-        SPARK_TIMEOUT,
-    )
+    instruction = _answer_instruction(question, scene, flow, extra, landmarks)
+    if allow_empty:
+        raw = _race_read(
+            lambda: _vlm_text(SPARK_MODEL, image, instruction, SPARK_TIMEOUT),
+            lambda: _baseten_complete(instruction, ANSWER_BASETEN_TIMEOUT,
+                                      image=image),
+            ANSWER_SPARK_GRACE_S, ANSWER_BASETEN_TIMEOUT,
+            ANSWER_DEADLINE_S, "answer")
+    else:
+        raw = _vlm_text(SPARK_MODEL, image, instruction, SPARK_TIMEOUT)
     m = re.search(r"\{.*\}", raw, re.S)
     if m:
         try:
@@ -3431,6 +3469,14 @@ def run_ask(
     # Part A — precedence: text -> audio transcript -> clip transcript.
     # Lazy: ASR runs only when the text question is empty.
     question_source = "text" if question else "none"
+    # Naming needs only the image: while a spoken question is transcribed
+    # it already runs (most asks are open-scene, flow A). A B/C route
+    # discards it; its error matters only if flow A then needs it.
+    naming = None
+    if not question and audio_enabled() and (audio_bytes or media_bytes):
+        naming = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        named = naming.submit(name_scene, image)
+        naming.shutdown(wait=False)
     if not question and audio_enabled():
         if audio_bytes:
             t = transcribe_question(audio_bytes)
@@ -3458,7 +3504,7 @@ def run_ask(
     elif flow == "B":
         scene = flow_b(image, sam_prompt)
     else:
-        scene = flow_a(image)
+        scene = flow_a(image, named.result() if naming else None)
 
     # Answer tightening — merge duplicate instances before anything
     # consumes the scene (gate state, answer context, chips, eval).
