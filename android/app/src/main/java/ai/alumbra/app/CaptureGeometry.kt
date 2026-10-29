@@ -7,7 +7,7 @@ import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
-import androidx.camera.core.ImageCapture
+import androidx.camera.core.ResolutionInfo
 import java.io.File
 import java.util.Locale
 import kotlin.math.asin
@@ -42,9 +42,28 @@ object CaptureGeometry {
     }
 
     /**
-     * Focal length in pixels of the uploaded JPEG.
+     * Pitch of a clip frame: the median of the gravity samples within
+     * [windowNs] of [frameNs] (both on the elapsedRealtimeNanos clock),
+     * so hand shake at that instant does not set it. Null without a
+     * sample near the frame.
+     */
+    fun pitchAt(
+        samples: List<Pair<Long, FloatArray>>,
+        frameNs: Long,
+        windowNs: Long = 150_000_000L,
+    ): Double? {
+        val near = samples.filter { kotlin.math.abs(it.first - frameNs) <= windowNs }
+            .mapNotNull { pitchDownDeg(it.second) }
+            .sorted()
+        if (near.isEmpty()) return null
+        return near[near.size / 2]
+    }
+
+    /**
+     * Focal length in pixels of the uploaded JPEG (a photo, or a frame
+     * taken from a clip: [res] is that use case's resolution info).
      *
-     * The ImageCapture stream (bound beside VideoCapture HD, so 16:9) is
+     * The stream (ImageCapture beside VideoCapture HD, or the HD video) is
      * the largest centered crop of the sensor's active array with the
      * stream's aspect, scaled to the stream size, then narrowed by the
      * zoom ratio. CameraX may crop it further (cropRect) and the saved
@@ -55,7 +74,7 @@ object CaptureGeometry {
      * width. Principal point assumed at the image center.
      */
     @OptIn(ExperimentalCamera2Interop::class)
-    fun focalPx(camera: Camera, capture: ImageCapture, jpeg: File): Double? {
+    fun focalPx(camera: Camera, res: ResolutionInfo?, jpeg: File): Double? {
         return try {
             val info = Camera2CameraInfo.from(camera.cameraInfo)
             val active = info.getCameraCharacteristic(
@@ -81,7 +100,7 @@ object CaptureGeometry {
             val fromCalib = calib?.firstOrNull()?.takeIf { it > 0f }
             val fActive = (fromCalib ?: fromSpec)?.toDouble() ?: return null
 
-            val res = capture.resolutionInfo ?: return null
+            if (res == null) return null
             val stream = res.resolution  // sensor orientation, pre-rotation
             val streamAspect = stream.width.toDouble() / stream.height
             val activeAspect = active.width().toDouble() / active.height()

@@ -742,3 +742,53 @@ Replaying the live tape tests (phone at ~5 ft, focal 862.1 at 960x1280):
   - **After** (20261029-130300): 24 pass, 3 fail (case_02.Q2, case_07.Q3, case_13.Q1, all known), 0 errors.
   - Median photo-case latency fell from 31 s to 23 s, or 37 s to 23 s by report median. The before run had a slow-API tail (100–300 s on navigation cases). Over Oct 28's runs the median was 36–40 s.
   - No 429s in the after run's server log (the logging is new, so the before run can't be checked the same way).
+
+### Items 1–5 (Oct 29 afternoon)
+
+1. **Clip asks send capture metadata.**
+   - While a clip records, the app keeps the gravity samples with their sensor timestamps.
+   - The sent frame is now the exact middle frame (OPTION_CLOSEST, not the nearest sync frame), so its instant is known.
+   - pitch is the median of the samples within ±150 ms of that instant (`CaptureGeometry.pitchAt`).
+   - focal_px is the HD video stream's (`videoCapture.resolutionInfo`), in frame px.
+   - The logcat line is `clip meta pitch_deg=… focal_px=… samples=… frame_us=…`.
+   - The backend needed nothing new: a 720x1280 upright frame passes through `upright_photo` unchanged.
+2. **Objects the naming step misses.**
+   - Naming returns 11–14 nouns in a furnished room, and `MAX_NOUNS` 10 cut 1–4 of them on every run. The cap is now 16.
+   - The floor-read prompt ("What small object is lying on the floor…") read a cardboard scratcher as "phone" or NONE. The neutral wording reads it 3/3, keeps all three ice reads in the fridge fixture, and still answers NONE on bare floor.
+   - The floor look already ran on every path question, so no change was needed there.
+3. **A named goal that isn't visible no longer hides what's ahead.**
+   - `no_goal_visible` now carries `ahead`, the straight-ahead assessment.
+   - The lead adds "The way straight ahead is clear." or the usual "Careful — …".
+   - In the dark, the clear sentence is dropped, as with the existing clear verdict.
+4. **False detections.**
+   - Floor reads naming a body part (foot, hand, toe, finger) are discarded. Shoes are kept.
+   - SAM "person" boxes shorter than 3.5% of the frame are dropped. These were the wall-art figures, "person x10".
+5. **Latency.**
+   - Profile of office_exit, two runs: segmentation under 2 s, naming 3–5 s, floor reads on Spark 8–64 s each (the ask waits on the slowest), final answer 19–28 s.
+   - Floor reads now go to Baseten first (10 s budget), with Spark as the retry under a 30 s deadline; `BASETEN_ENABLED=0` makes it Spark only.
+   - The same ask now takes 24–28 s (was 71–101 s) with an identical answer.
+   - Medication label reads stay on Spark.
+- Offline: 281 checks pass with no failures. The old "path lead no goal" unit test was updated to the new behaviour (item 3); no eval check changed.
+
+#### Item 5 revised: race, not Baseten-first
+
+The Baseten-first eval (20261029-141835) scored 23/27 with a median of 24.5 s and no 429s. But fridge_ice failed: Baseten read the floor ice as "rice", "plastic cap" and "white stones". On the fixture crops, Baseten got ice1 and ice2 right 6/6 but called ice3 "garlic cloves" 3/3, while Spark was 9/9 correct in 5–17 s.
+
+`_floor_read` now races the two: Spark's read wins if it lands within 15 s, otherwise Baseten's is used (or Spark's, up to 30 s, if Baseten failed). Both failing raises StageFailed.
+
+Eval 20261029-143157: 22/27, median 25.5 s, 0 errors, 0 429s. fridge_ice passes ("ice cubes … in your path"); the navigation cases take 20–45 s (they were 100–300 s in this morning's slow baseline and 44–73 s on Oct 28). The two new fails don't come from this change:
+- case_03.Q1: naming said "wet pavement" instead of "puddle", so scene_must failed. The floor look found 0 in all three runs.
+- case_12.Q4: Spark said "can't see aspirin", which isn't on the check's list of phrasings. The find flow isn't touched.
+
+The eval checks stay frozen.
+
+#### First clip test with metadata (Oct 29, 15:37)
+
+The phone sent pitch 24.83, focal 862.1 and 677 gravity samples, and the answer gave meters ("cardboard scratcher … about 2 meters away"). Phone-measured time was 55.7 s.
+
+Replaying the same clip in-process:
+- Profile: ASR 1.2 s, naming 7 s, SAM 23 calls in 5 s, floor look 22 s, final Spark 12.8 s.
+- The floor look was slow for two reasons: its 8 reads ran in two waves on the 5-worker pool, and one Spark read took 14.9 s against a 15 s grace.
+- Fix: reads now run in one wave (a worker per crop, at most 8) with a 10 s grace. The same clip then took 31.6–42.8 s over five runs.
+- One of those runs missed the scratcher. Naming didn't list it, and the floor look read it as bare "ramp", which is passable. Floor-look finds now carry `floor_find`, and `_not_obstruction` never treats them as passage.
+- Offline: 283 checks pass with no failures.

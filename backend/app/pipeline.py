@@ -66,7 +66,10 @@ WONDER_READ_PROMPT = (
 )
 
 SAFETY_LIST = ["car", "person", "stairs", "door", "curb"]
-MAX_NOUNS = 10
+# Naming routinely returns 11-14 nouns in a furnished room; at 10 the
+# tail was cut (live 2026-10-29: 1-4 dropped every run, the floor object
+# among them). Fan-out is concurrent, so more phrases cost little.
+MAX_NOUNS = 16
 FLOW_C_CROP_CAP = 24
 FLOW_C_IOU = 0.7
 SAM_TIMEOUT = 180
@@ -458,10 +461,14 @@ def _stands_on_floor(entry: dict[str, Any], height: int) -> bool:
 # each proposal (the cabinet pattern). Navigation asks only; skipped
 # in the dark (nothing to see) and by FLOOR_LOOK_ENABLED=0.
 FLOOR_PHRASE = "small object on the floor"
+# "small object lying on the floor" steered the read onto any small dark
+# detail: a cardboard cat scratcher read as "phone" / NONE (live
+# 2026-10-29); this wording read it 3/3 and kept every ice cube in the
+# fridge fixture, bare floor still NONE.
 FLOOR_READ_PROMPT = (
-    "What small object is lying on the floor in this crop? Reply with "
-    "ONLY a short name (for example: ice cubes, cord, toy), or NONE "
-    "if nothing distinct is visible. No other words."
+    "What object is on the floor in the middle of this crop? Reply with "
+    "ONLY a short name (for example: ice cubes, cord, toy, box), or NONE "
+    "if it is only bare floor. No other words."
 )
 FLOOR_REGION_WORDS = {
     "floor", "ground", "tile", "rug", "carpet", "lawn", "grass",
@@ -1140,7 +1147,10 @@ def _not_obstruction(
         return "surface"
     if _has_word(name, GROUND_WORDS):
         return "ground_cover"
-    if _has_word(name, PASSABLE_WORDS) and not (
+    # A floor-look find is an object lying on the floor by construction:
+    # its read is never a way through (a scratcher read as bare "ramp"
+    # vanished from the route, 2026-10-29).
+    if _has_word(name, PASSABLE_WORDS) and not e.get("floor_find") and not (
             _has_word(name, {"ramp", "ramps"})
             and _has_word(name, PET_TOY_WORDS)):
         return "passage"
@@ -1259,9 +1269,16 @@ def _path_assessment(
     g = _resolve_goal(scene, question, hint)
     goal, goal_desc = g["goal"], g["desc"]
     if g["named"] and goal is None:
+        # The named place is not in view, but what is straight ahead is:
+        # the user still hears it (live 2026-10-29: "I can't see the
+        # kitchen" said nothing of the scratcher a meter ahead).
+        ahead = _path_assessment(scene, "", height, "", width, openings,
+                                 camera)
         return {"goal": None, "goal_clock": None, "goal_size": None,
                 "verdict": "no_goal_visible", "on_path": [],
-                "goal_desc": goal_desc}
+                "goal_desc": goal_desc,
+                "ahead": {"verdict": ahead["verdict"],
+                          "on_path": ahead["on_path"]}}
     goal_clock = int(goal["clock"]) if goal else 12
     w = width or max([int(e["box"][2]) for e in scene] or [1])
     h = height or max([int(e["box"][3]) for e in scene] or [1])
@@ -2459,10 +2476,26 @@ def _ground(
     scene: list[dict[str, Any]] = []
     for phrase in prompts:
         for rec in by_phrase.get(phrase, []):
+            if phrase == "person" and _tiny_person(rec["box"], height):
+                continue
             scene.append(entry_for(
                 phrase, rec["box"], rec["confidence"], width, height
             ))
     return scene
+
+
+# A real person this short in the frame is ~40 m off at the clip size;
+# what SAM finds there indoors is people in pictures (live 2026-10-29: ten
+# "person" boxes, 20-33 px, the figures in wall art beside a desk).
+TINY_PERSON_FRAC = 0.035
+
+
+def _tiny_person(box: Any, height: int) -> bool:
+    try:
+        return height > 0 and (float(box[3]) - float(box[1])) \
+            < TINY_PERSON_FRAC * height
+    except (TypeError, ValueError, IndexError):
+        return False
 
 
 def flow_c(
@@ -2563,10 +2596,70 @@ def _floor_entry_size(box: tuple[int, int, int, int], height: int) -> str:
     return "far"
 
 
+# The user's own body at the frame's foot is never an obstacle (floor
+# reads of "foot" at the bottom edge, 2026-10-29). A shoe on the floor
+# can be, so shoes are not here.
+BODY_READ_WORDS = {"foot", "feet", "toe", "toes", "hand", "hands",
+                   "finger", "fingers"}
+
+
 def _discard_read(label: str) -> bool:
     """NONE/empty/unreadable crop results are discarded at ingestion —
-    never scene entries, never chips, never gate state."""
-    return label.strip().upper() in ("", "NONE")
+    never scene entries, never chips, never gate state. So are reads
+    naming a body part (the user's own foot or hand)."""
+    t = label.strip()
+    return t.upper() in ("", "NONE") or _has_word(t.lower(),
+                                                  BODY_READ_WORDS)
+
+
+# Profile 2026-10-29 (office exit, two runs): the floor reads on Spark
+# took 8-64 s each and the ask waited on the slowest (40-64 s of a
+# 71-101 s ask). Baseten reads in 2-5 s but is weaker on tiny crops (the
+# fridge fixture's ice read "garlic cloves", "rice", "white stones";
+# Spark 9/9 "ice cubes" in 5-17 s). So both run at once: Spark's read if
+# it lands within the grace, else Baseten's (Spark's if Baseten failed,
+# up to the deadline). Both failing fails the ask (StageFailed).
+# 10 s, not 15 (clip profile 2026-10-29: one 14.9 s Spark read held the
+# ask). On the fridge fixture the Spark reads past 10 s were ice1's, which
+# Baseten reads right; ice3 (Baseten: "garlic cloves") Spark does in 5-7 s.
+FLOOR_READ_SPARK_GRACE_S = 10
+FLOOR_READ_BASETEN_TIMEOUT = 10
+FLOOR_READ_DEADLINE_S = 30
+
+
+def _floor_read(crop: bytes) -> str:
+    """One floor-look crop read (see above)."""
+    spark = lambda: _vlm_text(CROP_READ_MODEL, crop, FLOOR_READ_PROMPT,
+                              READ_TIMEOUT).strip()
+    if not baseten_enabled():
+        return _run_stage("floor_look", lambda: _within(
+            FLOOR_READ_DEADLINE_S, spark))
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
+        f_sp = pool.submit(spark)
+        f_bt = pool.submit(lambda: _baseten_complete(
+            FLOOR_READ_PROMPT, FLOOR_READ_BASETEN_TIMEOUT,
+            image=crop).strip())
+        errors: list[BaseException] = []
+        try:
+            return f_sp.result(timeout=FLOOR_READ_SPARK_GRACE_S)
+        except concurrent.futures.TimeoutError:
+            pass
+        except Exception as e:
+            errors.append(e)
+        try:
+            return f_bt.result(timeout=FLOOR_READ_BASETEN_TIMEOUT)
+        except Exception as e:
+            errors.append(e)
+        if not f_sp.done() or f_sp.exception() is None:
+            try:
+                return f_sp.result(timeout=max(
+                    0.0, FLOOR_READ_DEADLINE_S - FLOOR_READ_SPARK_GRACE_S))
+            except Exception as e:
+                errors.append(e)
+        raise StageFailed("floor_look", errors[-1] if errors else None)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _floor_regions(
@@ -2647,13 +2740,12 @@ def floor_look(
                               max(1, int(cut.size[1] * s))))
         out = io.BytesIO()
         cut.save(out, format="JPEG", quality=90)
-        return _run_stage("floor_look", lambda: _vlm_text(
-            CROP_READ_MODEL, out.getvalue(), FLOOR_READ_PROMPT,
-            READ_TIMEOUT,
-        ).strip())
+        return _floor_read(out.getvalue())
 
+    # One wave: every crop (at most FLOOR_MAX_BOXES) reads at once; at 5
+    # workers 8 crops ran in two waves (+8 s on a clip ask, 2026-10-29).
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=FANOUT_WORKERS
+        max_workers=max(1, len(found))
     ) as pool:
         labels = list(pool.map(read, [b for b, _ in found]))
 
@@ -2664,6 +2756,7 @@ def floor_look(
             continue
         ent = entry_for(label.strip(), box, conf, width, height)
         ent["size_class"] = _floor_entry_size(box, height)
+        ent["floor_find"] = True
         entries.append(ent)
     return entries
 
@@ -2808,7 +2901,14 @@ def _path_opening(a: dict[str, Any]) -> list[str]:
     the goal is named once, after the obstruction."""
     desc = str(a.get("goal_desc") or "exit")
     if a["verdict"] == "no_goal_visible":
-        return [f"I can't see the {desc} in this photo."]
+        lead = [f"I can't see the {desc} in this photo."]
+        ahead = a.get("ahead")
+        if not ahead:
+            return lead
+        if ahead["verdict"] == "clear":
+            return lead + ["The way straight ahead is clear."]
+        return lead + _path_opening({"verdict": "blocked", "goal": None,
+                                     "on_path": ahead["on_path"]})
     # One mention per object: entries sharing a head noun (two ice
     # boxes SAM did not merge) are one obstacle, at every clock cited —
     # unless their metric distances differ beyond metric.AGREE_FRAC
@@ -2919,7 +3019,8 @@ def _tidy(
     ground = {h for h in heads if h in GROUND_WORDS}
     key = set(hazards)
     if assessment:
-        key |= {_head_noun(str(o["name"])) for o in assessment["on_path"]}
+        key |= {_head_noun(str(o["name"])) for o in assessment["on_path"]
+                + assessment.get("ahead", {}).get("on_path", [])}
         key.add(_head_noun(str(assessment.get("goal") or "")))
         key.add(_head_noun(str(assessment.get("goal_desc") or "")))
     surface_question = bool(SURFACE_Q_RE.search(question or ""))
@@ -3023,9 +3124,16 @@ def baseten_enabled() -> bool:
     ) and bool(_load_secret("BASETEN_API_KEY"))
 
 
-def _baseten_complete(instruction: str, timeout: int) -> str:
-    """Text-only chat completion on Baseten (OpenAI-compatible,
-    non-streaming)."""
+def _baseten_complete(instruction: str, timeout: int,
+                      image: bytes | None = None) -> str:
+    """Chat completion on Baseten (OpenAI-compatible, non-streaming);
+    with image, the image goes in the same user turn."""
+    content: Any = instruction
+    if image is not None:
+        b64 = base64.b64encode(image).decode("ascii")
+        content = [{"type": "text", "text": instruction},
+                   {"type": "image_url", "image_url": {
+                       "url": f"data:{_mime_of(image)};base64,{b64}"}}]
     try:
         resp = requests.post(
             f"{BASETEN_API_BASE}/chat/completions",
@@ -3033,7 +3141,7 @@ def _baseten_complete(instruction: str, timeout: int) -> str:
                      f"Bearer {_load_secret('BASETEN_API_KEY')}"},
             json={
                 "model": BASETEN_SYNTH_MODEL,
-                "messages": [{"role": "user", "content": instruction}],
+                "messages": [{"role": "user", "content": content}],
                 "reasoning_effort": BASETEN_REASONING_EFFORT,
                 "max_tokens": BASETEN_MAX_TOKENS,
                 "temperature": BASETEN_TEMPERATURE,
@@ -3542,6 +3650,10 @@ def _compose(
         if assessment["goal"] or assessment["verdict"] == "no_goal_visible":
             referent = str(assessment["goal_desc"])
         if kind == "path":
+            if p85 < DARK_P85 and assessment.get("ahead", {}).get(
+                    "verdict") == "clear":
+                # As below: nothing certifies a clear way in the dark.
+                assessment = dict(assessment, ahead=None)
             opening = _path_opening(assessment)
             if assessment["verdict"] == "clear" and p85 < DARK_P85:
                 # Nothing certified a clear path in the dark (the floor

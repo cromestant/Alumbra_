@@ -306,7 +306,19 @@ check("path lead blocked", p._path_opening(_fa),
 check("path lead clear to goal", p._path_opening(_tw2),
       ["Yes — the way to the table is clear, at your 12 o'clock, "
        "far away."])
-check("path lead no goal", p._path_opening(_pa3),
+# 2026-10-29: the named goal out of view no longer hides what is
+# straight ahead (the chair in front of the user is still said).
+check("path lead no goal: then what is straight ahead",
+      p._path_opening(_pa3),
+      ["I can't see the elevator in this photo.",
+       "Careful — chair is in your path at 11 o'clock, close."])
+check("path lead no goal, nothing ahead: says the way ahead is clear",
+      p._path_opening(dict(_pa3, ahead={"verdict": "clear",
+                                        "on_path": []})),
+      ["I can't see the elevator in this photo.",
+       "The way straight ahead is clear."])
+check("path lead no goal, no ahead facts (old shape): the lead only",
+      p._path_opening({k: v for k, v in _pa3.items() if k != "ahead"}),
       ["I can't see the elevator in this photo."])
 
 # Rule 4 — tidy: the recitation collapses before synthesis.
@@ -1570,6 +1582,74 @@ check("session: one pooled session, sized above the fan-out",
       (isinstance(p._HTTP, p.requests.Session),
        p._HTTP.get_adapter("https://api.meta.ai")._pool_maxsize
        >= p.sam_concurrency()), (True, True))
+
+# Items 2/4 (2026-10-29): noun cap, floor reads, tiny persons.
+check("naming keeps up to 16 nouns",
+      len(p.parse_nouns(_json.dumps([f"thing {i}" for i in range(20)]))), 16)
+check("floor read: body parts are discarded, a shoe is kept",
+      [p._discard_read(x) for x in ("foot", "Feet", "hand", "NONE", "shoe",
+                                    "scratcher", "ice cubes")],
+      [True, True, True, True, False, False, False])
+check("floor read prompt: neutral, not 'small object'",
+      ("small object" in p.FLOOR_READ_PROMPT, "NONE" in p.FLOOR_READ_PROMPT),
+      (False, True))
+_real_sm = p.sam_many
+p.sam_many = lambda img, phrases: {
+    ph: ([{"box": (695, 143, 715, 172), "confidence": 0.76},
+          {"box": (0, 98, 45, 399), "confidence": 0.86}]
+         if ph == "person" else []) for ph in phrases}
+_ppl = [e for e in p._ground(_live_jpeg, ["person", "lamp"], 720, 1280)
+        if e["name"] == "person"]
+check("person: a 29 px figure (wall art) is dropped, a 300 px one kept",
+      [list(e["box"]) for e in _ppl], [[0, 98, 45, 399]])
+p.sam_many = _real_sm
+
+# Item 5 (2026-10-29): floor reads race Spark (preferred within the
+# grace) against Baseten (used when Spark is late).
+_rb, _rv, _rs = p._baseten_complete, p._vlm_text, p._load_secret
+_grace = p.FLOOR_READ_SPARK_GRACE_S
+p.FLOOR_READ_SPARK_GRACE_S = 0.3
+p._load_secret = lambda name: "k" if name == "BASETEN_API_KEY" else _rs(name)
+del _os.environ["BASETEN_ENABLED"]
+p._baseten_complete = lambda instr, t, image=None: (
+    _time.sleep(0.01), " garlic cloves\n")[1]
+p._vlm_text = lambda m, img, instr, t: (_time.sleep(0.05), "ice cubes")[1]
+check("floor read: Spark on time wins over a faster Baseten",
+      p._floor_read(b"crop"), "ice cubes")
+p._vlm_text = lambda m, img, instr, t: (_time.sleep(2), "late")[1]
+_t0 = _time.time()
+_late = p._floor_read(b"crop")
+check("floor read: Spark past the grace -> Baseten's read, no wait for "
+      "Spark", (_late, _time.time() - _t0 < 1.5), ("garlic cloves", True))
+def _bt_fail(instr, t, image=None):
+    raise p.PipelineError("Baseten HTTP 503")
+p._baseten_complete = _bt_fail
+p._vlm_text = lambda m, img, instr, t: (_time.sleep(0.5), "toy")[1]
+check("floor read: Baseten fails, Spark late -> Spark's read",
+      p._floor_read(b"crop"), "toy")
+p._vlm_text = lambda m, img, instr, t: (_ for _ in ()).throw(
+    p.PipelineError("spark down"))
+try:
+    p._floor_read(b"crop"); _fr = "no error"
+except p.StageFailed as e:
+    _fr = e.stage
+check("floor read: both fail -> the ask errors (floor_look)", _fr,
+      "floor_look")
+_os.environ["BASETEN_ENABLED"] = "0"
+_reads = []
+p._vlm_text = lambda m, img, instr, t: (_reads.append("spark"), "cord")[1]
+check("floor read: BASETEN_ENABLED=0 -> Spark only",
+      (p._floor_read(b"crop"), _reads), ("cord", ["spark"]))
+p._baseten_complete, p._vlm_text, p._load_secret = _rb, _rv, _rs
+p.FLOOR_READ_SPARK_GRACE_S = _grace
+
+check("floor find read as bare 'ramp' is an object; a named ramp passes",
+      (p._not_obstruction(dict(p.entry_for("ramp", (287, 674, 455, 843), 0.9,
+                                           720, 1280), floor_find=True),
+                          None, [], [], 1280),
+       p._not_obstruction(p.entry_for("ramp", (287, 674, 455, 843), 0.9,
+                                      720, 1280), None, [], [], 1280)),
+      ("", "passage"))
 
 # App wiring
 from app.main import app

@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
@@ -99,6 +100,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // for metric distance (CaptureGeometry).
     private var lastGravity: FloatArray? = null
     private var shutterGravity: FloatArray? = null
+    // A clip's gravity samples (sensor timestamp ns, vector) while it
+    // records, and when recording began on the same clock: the sent
+    // frame's pitch is read at its own instant (CaptureGeometry.pitchAt).
+    private val clipGravity = ArrayList<Pair<Long, FloatArray>>()
+    @Volatile private var clipSampling = false
+    private var clipStartNs = 0L
 
     private val holdRunnable = Runnable { beginClipRecording() }
     private val followupHoldRunnable = Runnable { beginFollowupHold() }
@@ -471,6 +478,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             event.sensor.type == Sensor.TYPE_ACCELEROMETER
         ) {
             lastGravity = event.values.copyOf(3)
+            if (clipSampling) {
+                synchronized(clipGravity) {
+                    clipGravity.add(event.timestamp to event.values.copyOf(3))
+                }
+            }
             return
         }
         if (event.sensor.type != Sensor.TYPE_LIGHT) return
@@ -542,7 +554,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val cam = camera
         val capture = imageCapture
         val focal = if (cam != null && capture != null) {
-            CaptureGeometry.focalPx(cam, capture, file)
+            CaptureGeometry.focalPx(cam, capture.resolutionInfo, file)
         } else null
         Log.i("Alumbra", "capture meta pitch_deg=$pitch focal_px=$focal")
         return if (pitch != null && focal != null) {
@@ -609,6 +621,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 announce(Spoken.PERMISSIONS_NEEDED)
                 return@ensurePermissions
             }
+            synchronized(clipGravity) { clipGravity.clear() }
+            clipStartNs = 0L
+            clipSampling = true
             try {
                 clipRecording = video.output
                     .prepareRecording(
@@ -617,6 +632,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     )
                     .withAudioEnabled()
                     .start(ContextCompat.getMainExecutor(this)) { event ->
+                        if (event is VideoRecordEvent.Start) {
+                            clipStartNs = SystemClock.elapsedRealtimeNanos()
+                        }
                         if (event is VideoRecordEvent.Finalize) {
                             if (event.hasError()) {
                                 // Technical text: History detail + log only.
@@ -645,6 +663,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 statusOnly(Spoken.RECORDING_START)
             } catch (e: Exception) {
                 clipRecording = null
+                clipSampling = false
                 tts.micHot = false
                 showMicIdle()
                 endCapture()
@@ -660,6 +679,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         } catch (e: Exception) {
         }
         clipRecording = null
+        clipSampling = false
         // Mic closed: stop cue now, speech safe from here on.
         tts.micHot = false
         showMicIdle()
@@ -699,7 +719,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // Typed text wins; otherwise the server transcribes the clip.
         val question = typed.ifEmpty { null }
         Thread {
-            val frame = extractMiddleFrame(file)
+            val mid = extractMiddleFrame(file)
+            val frame = mid?.first
+            val meta = mid?.let { clipMeta(it.first, it.second) }
             runOnUiThread {
                 if (frame == null) {
                     hideWorking()
@@ -710,29 +732,56 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     return@runOnUiThread
                 }
                 // The clip carries its own audio track; attached as media.
-                api.ask(frame, question, audio = null, media = file) {
+                api.ask(frame, question, audio = null, media = file,
+                        meta = meta) {
                     onAskOutcome(question, it)
                 }
             }
         }.start()
     }
 
-    private fun extractMiddleFrame(clip: File): File? {
+    /**
+     * Pitch at the sent frame's instant + the video stream's focal length
+     * in frame px, or null (no samples near the frame, start unknown).
+     */
+    private fun clipMeta(frame: File, frameUs: Long): CaptureMeta? {
+        val start = clipStartNs
+        val samples = synchronized(clipGravity) { clipGravity.toList() }
+        val pitch = if (start > 0L) {
+            CaptureGeometry.pitchAt(samples, start + frameUs * 1000)
+        } else null
+        val cam = camera
+        val focal = if (cam != null) {
+            CaptureGeometry.focalPx(cam, videoCapture?.resolutionInfo, frame)
+        } else null
+        Log.i(
+            "Alumbra",
+            "clip meta pitch_deg=$pitch focal_px=$focal " +
+                "samples=${samples.size} frame_us=$frameUs",
+        )
+        return if (pitch != null && focal != null) {
+            CaptureMeta(pitch, focal)
+        } else null
+    }
+
+    /** The clip's middle frame (exact, not the nearest sync frame, so
+     *  its instant is known for the pitch) and that instant in us. */
+    private fun extractMiddleFrame(clip: File): Pair<File, Long>? {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(clip.absolutePath)
             val durationMs = retriever.extractMetadata(
                 MediaMetadataRetriever.METADATA_KEY_DURATION
             )?.toLongOrNull() ?: 0L
+            val frameUs = (durationMs / 2) * 1000
             val frame: Bitmap = retriever.getFrameAtTime(
-                (durationMs / 2) * 1000,
-                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                frameUs, MediaMetadataRetriever.OPTION_CLOSEST,
             ) ?: return null
             val out = File(cacheDir, "frame_${System.currentTimeMillis()}.jpg")
             FileOutputStream(out).use {
                 frame.compress(Bitmap.CompressFormat.JPEG, 90, it)
             }
-            out
+            out to frameUs
         } catch (e: Exception) {
             null
         } finally {
