@@ -16,9 +16,10 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import capture
+from . import capture, metric
 from .pipeline import (
     FollowupExpired, PipelineError, StageFailed, run_ask, run_followup,
+    sweep_ask_store,
 )
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
@@ -36,6 +37,8 @@ def _stage_failed(e: StageFailed) -> HTTPException:
 
 
 def create_app() -> FastAPI:
+    # Persisted follow-ups that expired while the server was down go now.
+    sweep_ask_store()
     app = FastAPI(
         title="Alumbra",
         description="Visual assistance for blind and low-vision users.",
@@ -81,11 +84,15 @@ def create_app() -> FastAPI:
         question: str = Form(""),
         media: UploadFile | None = File(None),
         audio: UploadFile | None = File(None),
+        pitch_deg: str | None = Form(None),
+        focal_px: str | None = Form(None),
     ) -> JSONResponse:
         """Snap & ask: JPEG photo + optional question -> grounded answer.
 
         media/audio carry the ask's clip/window audio; when the text
         question is empty the pipeline transcribes them for the question.
+        pitch_deg/focal_px are the app's capture metadata (metric.py);
+        without both, the answer is exactly as before.
         Response: {answer, behavior, confidence, scene_model, flow, gate,
         signals, question_used, question_source} where behavior is
         ANSWER or ESCALATE.
@@ -95,13 +102,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="empty image upload")
         media_bytes = await media.read() if media and media.filename else None
         audio_bytes = await audio.read() if audio and audio.filename else None
+        camera = metric.parse_camera(pitch_deg, focal_px)
+        # The capture keeps the upload as received; the pipeline sees it
+        # upright and capped (a follow-up's reload does the same).
         cap = capture.begin("ask", question or "", data, media_bytes,
-                            audio_bytes)
+                            audio_bytes, camera=camera)
+        data, scale = metric.upright_photo(data)
+        camera = metric.scale_camera(camera, scale)
         trace: dict = {}
         try:
             result = await asyncio.to_thread(
                 run_ask, data, question or "", media_bytes, audio_bytes,
-                trace,
+                trace, cap, camera,
             )
         except StageFailed as e:
             err = _stage_failed(e)
@@ -126,7 +138,7 @@ def create_app() -> FastAPI:
 
         No image: perception (naming, segmentation, merging, second
         looks) is reused from the cached ask. 410 when the ask id is
-        unknown or its 15-minute cache entry expired — the app then
+        unknown or its cache entry expired (ASK_TTL_S, default an hour) — the app then
         says so plainly and offers a fresh ask.
         """
         audio_bytes = await audio.read() if audio and audio.filename else None
@@ -137,7 +149,7 @@ def create_app() -> FastAPI:
         try:
             result = await asyncio.to_thread(
                 run_followup, ask_id or "", question or "", audio_bytes,
-                trace,
+                trace, cap,
             )
         except FollowupExpired as e:
             capture.fail(cap, 410, str(e))

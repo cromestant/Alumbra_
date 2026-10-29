@@ -18,6 +18,13 @@ Grading (per the eval brief):
   - Non-200 responses mark the question ERROR. Skipped clip cases never
     affect the exit code.
 
+Synthesis-stage cases (cases.json "synthesis"): no photo draft reaches
+the synthesis gate (4+ cuttable sentences), so a recorded live draft is
+fed straight into pipeline.synthesize_answer, in-process with the real
+providers (Baseten first, contributor Spark retry), and graded: the stage
+applied, warnings verbatim, first sentence first, every landmark kept,
+output shorter than the draft. A StageFailed is an ERROR.
+
 Outputs: eval/runs/<timestamp>/q_*.json (raw /ask responses) + report.md.
 Run outputs stay local (gitignored), never committed.
 """
@@ -184,6 +191,83 @@ def grade_question(q: dict, body: dict) -> dict:
     return {"status": status, "checks": checks}
 
 
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def grade_synthesis(spec: dict, out: str, applied: bool) -> dict:
+    """Grade one synthesis-stage output against its recorded draft."""
+    draft = spec["draft"]
+    checks = []
+    if spec.get("must_apply"):
+        checks.append({"check": "synthesis applied", "passed": bool(applied),
+                       "evidence": f"applied={applied}"})
+    for line in spec.get("verbatim", []):
+        checks.append({"check": f"verbatim {line!r}",
+                       "passed": _norm(line) in _norm(out),
+                       "evidence": ("present" if _norm(line) in _norm(out)
+                                    else "missing or altered")})
+    if spec.get("first_sentence_first"):
+        lead = sentences_with_offsets(draft)[0][2]
+        ok = _norm(out).startswith(_norm(lead))
+        checks.append({"check": "first sentence stays first", "passed": ok,
+                       "evidence": (f"lead {lead!r}" if ok else
+                                    f"output opens: {_norm(out)[:80]!r}")})
+    for word in spec.get("keep", []):
+        rx = re.compile(r"\b" + re.escape(word) + r"s?\b", re.IGNORECASE)
+        hit = rx.search(out)
+        checks.append({"check": f"keeps landmark {word!r}",
+                       "passed": hit is not None,
+                       "evidence": (repr(sentence_at(out, hit.start()))
+                                    if hit else "dropped")})
+    if spec.get("shorter"):
+        n_out, n_draft = len(out.split()), len(draft.split())
+        checks.append({"check": "shorter than the draft",
+                       "passed": n_out < n_draft,
+                       "evidence": f"{n_out} words vs {n_draft}"})
+    status = "pass" if all(c["passed"] for c in checks) else "fail"
+    return {"status": status, "checks": checks}
+
+
+def _synth_result(spec: dict, raw: dict) -> dict:
+    base = {"id": spec["id"], "file": "(synthesis stage, recorded draft)",
+            "question": spec["question"], "elapsed_s": raw.get("elapsed_s")}
+    if "error" in raw:
+        return dict(base, status="error", error=raw["error"])
+    graded = grade_synthesis(spec, raw["output"], raw["applied"])
+    checks = graded["checks"] + [{
+        "check": "provider (report-only)", "passed": True,
+        "evidence": f"served by {raw.get('provider')!r}"}]
+    return dict(base, status=graded["status"], checks=checks,
+                behavior="SYNTHESIS", confidence=None,
+                answer=raw["output"], scene_names=spec.get("landmarks", []))
+
+
+def run_synthesis_case(spec: dict, run_dir: Path) -> dict:
+    """Feed the recorded draft into the real synthesis stage."""
+    if str(ROOT / "backend") not in sys.path:
+        sys.path.insert(0, str(ROOT / "backend"))
+    from app import pipeline
+
+    meta: dict = {}
+    t0 = time.time()
+    try:
+        out, applied, _ = pipeline.synthesize_answer(
+            spec["draft"], spec["question"], spec["scene"],
+            spec.get("assessment"), spec.get("hazards", []),
+            [{"name": n} for n in spec.get("landmarks", [])], meta)
+        raw = {"output": out, "applied": applied,
+               "provider": meta.get("synth_provider")}
+    except Exception as e:
+        raw = {"error": f"{type(e).__name__}: {e}",
+               "provider": meta.get("synth_provider")}
+    raw.update(id=spec["id"], draft=spec["draft"],
+               elapsed_s=round(time.time() - t0, 1))
+    (run_dir / f"{spec['id']}.json").write_text(
+        json.dumps(raw, indent=1, ensure_ascii=False))
+    return _synth_result(spec, raw)
+
+
 # ----------------------------------------------------------------------------
 # Server management
 # ----------------------------------------------------------------------------
@@ -344,6 +428,26 @@ def self_test() -> int:
                            "behavior": "ANSWER", "scene_model": []})
     check("grade ban-fail", g["status"], "fail")
 
+    sspec = {"draft": "Careful — x is in your path. The lawn is far. "
+                      "The table is far.",
+             "must_apply": True, "verbatim": ["Careful — x is in your path."],
+             "first_sentence_first": True, "keep": ["lawn", "table"],
+             "shorter": True}
+    check("synth grade pass", grade_synthesis(
+        sspec, "Careful — x is in your path. The lawn and table are far.",
+        True)["status"], "pass")
+    check("synth grade dropped landmark", grade_synthesis(
+        sspec, "Careful — x is in your path. The table is far.",
+        True)["status"], "fail")
+    check("synth grade lead moved", grade_synthesis(
+        sspec, "The lawn and table are far. Careful — x is in your path.",
+        True)["status"], "fail")
+    check("synth grade not shorter", grade_synthesis(
+        sspec, sspec["draft"], True)["status"], "fail")
+    check("synth grade skipped stage", grade_synthesis(
+        sspec, "Careful — x is in your path. The lawn and table are far.",
+        False)["status"], "fail")
+
     print("FAILURES:", fails if fails else "none")
     return 1 if fails else 0
 
@@ -385,6 +489,12 @@ def report_only(run_dir: Path) -> int:
                             for e in body.get("scene_model", []) or []],
             "elapsed_s": elapsed,
         })
+    for spec in cases.get("synthesis", []):
+        raw_path = run_dir / f"{spec['id']}.json"
+        if raw_path.exists():
+            raw = json.loads(raw_path.read_text())
+            total_elapsed += raw.get("elapsed_s") or 0
+            results.append(_synth_result(spec, raw))
     for clip in cases.get("clips", []):
         results.append({"id": clip["case"], "status": "skip",
                         "skip_reason": clip.get("skip_reason", "skipped")})
@@ -428,7 +538,10 @@ def main() -> int:
             if args.only and not any(q["id"].startswith(p) for p in args.only):
                 continue
             wanted.append((case, q))
-    if not wanted:
+    synth_wanted = [s for s in cases.get("synthesis", [])
+                    if not args.only
+                    or any(s["id"].startswith(p) for p in args.only)]
+    if not wanted and not synth_wanted:
         print("No questions selected.")
         return 2
 
@@ -445,7 +558,9 @@ def main() -> int:
     results: list[dict] = []
 
     server_proc = None
-    if healthy(base_url):
+    if not wanted:
+        pass  # synthesis-stage cases only: in-process, no server
+    elif healthy(base_url):
         print(f"Using live server at {base_url}")
     else:
         port = urlparse(base_url).port or 8123
@@ -512,6 +627,17 @@ def main() -> int:
             bad = [c["check"] for c in graded["checks"] if not c["passed"]]
             print(f"  -> {graded['status'].upper()} "
                   f"({elapsed:.0f}s)" + (f" failed: {bad}" if bad else ""),
+                  flush=True)
+        for spec in synth_wanted:
+            print(f"[synthesis] {spec['id']} {spec['question']!r}",
+                  flush=True)
+            res = run_synthesis_case(spec, run_dir)
+            results.append(res)
+            bad = [c["check"] for c in res.get("checks", [])
+                   if not c["passed"]]
+            print(f"  -> {res['status'].upper()} ({res['elapsed_s']}s)"
+                  + (f" failed: {bad}" if bad else "")
+                  + (f" {res['error']}" if res["status"] == "error" else ""),
                   flush=True)
         partial = False
     except KeyboardInterrupt:

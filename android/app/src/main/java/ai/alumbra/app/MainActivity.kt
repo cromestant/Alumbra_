@@ -95,6 +95,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // Torch lifecycle: the torch's life is the capture's life.
     private var captureActive = false
     private var lastLux = Float.MAX_VALUE
+    // Device-frame gravity, latest and at the shutter: the photo's pitch
+    // for metric distance (CaptureGeometry).
+    private var lastGravity: FloatArray? = null
+    private var shutterGravity: FloatArray? = null
 
     private val holdRunnable = Runnable { beginClipRecording() }
     private val followupHoldRunnable = Runnable { beginFollowupHold() }
@@ -250,6 +254,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 this, it, SensorManager.SENSOR_DELAY_NORMAL
             )
         }
+        (sensorManager?.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER))
+            ?.let {
+                sensorManager?.registerListener(
+                    this, it, SensorManager.SENSOR_DELAY_UI
+                )
+            }
         refreshLastAnswer()
     }
 
@@ -456,6 +467,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type == Sensor.TYPE_GRAVITY ||
+            event.sensor.type == Sensor.TYPE_ACCELEROMETER
+        ) {
+            lastGravity = event.values.copyOf(3)
+            return
+        }
         if (event.sensor.type != Sensor.TYPE_LIGHT) return
         lastLux = event.values[0]
         if (manualTorch || !captureActive) return
@@ -480,10 +497,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val file = File(
                 cacheDir, "ask_${System.currentTimeMillis()}.jpg"
             )
+            shutterGravity = lastGravity?.copyOf()
             capture.takePicture(
                 ImageCapture.OutputFileOptions.Builder(file).build(),
                 ContextCompat.getMainExecutor(this),
                 object : ImageCapture.OnImageSavedCallback {
+                    override fun onCaptureStarted() {
+                        // The shutter: the pitch the photo was taken at.
+                        shutterGravity = lastGravity?.copyOf()
+                    }
+
                     override fun onImageSaved(
                         output: ImageCapture.OutputFileResults
                     ) {
@@ -498,7 +521,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         Earcons.shutter()
                         statusOnly(Spoken.PHOTO_TAKEN)
                         showMicLive(hold = false)
-                        listenThenSend(photoFile = file)
+                        listenThenSend(photoFile = file, meta = captureMeta(file))
                     }
 
                     override fun onError(exc: ImageCaptureException) {
@@ -513,7 +536,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     /** ~4s live-transcribed window, then send the photo ask. */
-    private fun listenThenSend(photoFile: File) {
+    /** Pitch at the shutter + focal length in upload px, or null. */
+    private fun captureMeta(file: File): CaptureMeta? {
+        val pitch = CaptureGeometry.pitchDownDeg(shutterGravity)
+        val cam = camera
+        val capture = imageCapture
+        val focal = if (cam != null && capture != null) {
+            CaptureGeometry.focalPx(cam, capture, file)
+        } else null
+        Log.i("Alumbra", "capture meta pitch_deg=$pitch focal_px=$focal")
+        return if (pitch != null && focal != null) {
+            CaptureMeta(pitch, focal)
+        } else null
+    }
+
+    private fun listenThenSend(photoFile: File, meta: CaptureMeta?) {
         sending = true
         transcriptArrived = false
         recognizer = QuestionRecognizer(this) { transcript ->
@@ -521,7 +558,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             transcriptArrived = true
             tts.micHot = false
             showMicIdle()
-            sendPhotoAsk(photoFile, transcript)
+            sendPhotoAsk(photoFile, transcript, meta)
         }
         recognizer?.start()
         handler.postDelayed({
@@ -532,7 +569,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }, LISTEN_WINDOW_MS)
     }
 
-    private fun sendPhotoAsk(photoFile: File, transcript: String) {
+    private fun sendPhotoAsk(
+        photoFile: File,
+        transcript: String,
+        meta: CaptureMeta?,
+    ) {
         val typed = typeField.text.toString().trim()
         val question = typed.ifEmpty { transcript }.ifEmpty { null }
         // No "I heard" echo: the question is shown on the Answer screen
@@ -540,7 +581,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         showWorking(Spoken.PHOTO_SENT, Spoken.workingSub(false))
         // No raw-audio file for photo asks: SpeechRecognizer owns the mic
         // during the window, and concurrent capture is unreliable.
-        api.ask(photoFile, question, audio = null, media = null) {
+        api.ask(photoFile, question, audio = null, media = null, meta = meta) {
             onAskOutcome(question, it)
         }
     }

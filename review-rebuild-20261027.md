@@ -412,3 +412,333 @@ segment, **four cats** (sill cat included), 6.4 s in total. Clocks are
 relative to the sent photo, the clip's middle frame. In a sweep that
 frame is mid-turn, so positions are "where the phone pointed halfway
 through"; things beyond the photo clamp to 9 or 3 o'clock.
+
+## Follow-up TTL & persistence (2026-10-28)
+
+**On-disk layout:** one store, the capture folders.
+
+```
+backend/captures/2026-10-28/
+  20261028-121237-…-ask/        root ask
+    photo.jpg  clip.mp4         the only copy of the media
+    request.json response.json trace.json
+    cache-<ask_id>.json         cache entry: created, scene (full), flow,
+                                target, question, answer, behavior,
+                                floor_done, read_targets, referent,
+                                media_dir = "2026-10-28/20261028-121237-…-ask"
+  20261028-121304-…-followup/   follow-up
+    audio.wav (if spoken)  request.json response.json trace.json
+    cache-<new_id>.json         media_dir -> the ROOT ask's folder
+```
+
+**Lookup:** `_load_ask` checks memory (the hot layer, 32 entries).
+On a miss, with the store on, it globs `captures/*/*/cache-<ask_id>.json`
+and reads the photo/clip bytes from that entry's `media_dir`. The ask id
+is checked against `[A-Za-z0-9_-]{1,64}` before any glob, and
+`media_dir` must resolve inside `captures/`. If the entry is missing,
+corrupt, or its photo is gone, the result is the existing 410 with the
+same message (now one constant, `ASK_EXPIRED_MESSAGE`, same text). No
+index file: the glob is over at most 50 folders, and an index can't go
+stale.
+
+**One copy of each media file:** cache entries hold no bytes. A
+follow-up's entry points at its root ask's folder, and so does every
+later link in the chain. Verified live: one photo on disk for a
+three-ask chain.
+
+**TTL:** `ASK_TTL_S` env, default 3600 s, counted from each entry's
+`created`. Each follow-up mints a new id with a fresh TTL (unchanged).
+
+**Expiry deletes on disk:** every store, every load, and server start
+(`sweep_ask_store` in `create_app`) sweeps. Expired `cache-*.json` files
+are deleted. A folder's `photo.*`/`clip.*`/`audio.*` are deleted once
+no unexpired entry holds it (an entry holds its own folder and its
+`media_dir`), so a live follow-up keeps its root's photo. The sweep runs
+even with the store off: what an earlier run persisted never outlives
+its conversation. Request/response/trace JSON stays under the capture
+store's newest-50 cap.
+
+**Store off** (`ALUMBRA_ENV=production`, `CAPTURE_ENABLED=0`, or after
+2026-11-01): nothing is written, the cache is memory-only, and a restart
+ends the chain, exactly as before. Production follow-up persistence is a
+separate future decision.
+
+**Failure posture:** a failed disk write is logged and the ask
+continues memory-only. A failed rehydration is an expiry (410).
+
+**Bug found while testing:** `_store_ask` swept before writing. A
+follow-up whose parent expired while it was being answered (loaded at
+TTL−ε, ~30 s to answer) would have lost the root's photo before its own
+entry claimed it. Now it writes first, then sweeps. The new offline
+test fails with the old order (checked) and passes with the fix.
+
+**For Charles — two consequences of "expiry deletes":**
+1. A successful ask's photo/clip now lives only as long as its
+   conversation: one hour after the last follow-up, not "the last 50
+   asks". The capture store's after-the-fact media audit is now an
+   hour.
+2. A failed ask (503/502/410) has no cache entry, so its media stays
+   under the newest-50 cap. That's what the capture store was for, but
+   it means those photos outlive the hour.
+
+If either should go the other way, it's a one-line change. Also, more
+than 50 asks within an hour would push a live chain's root folder out
+under the count cap (its follow-up then gets a 410).
+
+### Verification (TTL & persistence)
+
+- Offline: 188 checks, FAILURES none. New checks:
+  - TTL default 3600;
+  - entry persisted next to its capture;
+  - restart (memory cleared) rehydrates the same scene, photo and clip;
+  - `run_followup` on the original id after a restart answers from the
+    cached scene;
+  - the follow-up references the root's media, never copies it; one
+    photo on disk;
+  - TTL−5 s is live; TTL+5 s gives the exact 410 message, with media
+    and cache entry gone;
+  - the expired follow-up's entry is gone;
+  - a parent that expired mid-answer still leaves its photo held by the
+    new follow-up;
+  - when the whole chain expires, root photo and follow-up audio are
+    gone;
+  - a corrupt entry gives 410;
+  - a failed disk write stays memory-only;
+  - store off writes nothing, and a restart ends the chain;
+  - `ASK_TTL_S` overrides the TTL.
+- Live, port 8124 (scratch captures folder):
+  - Ask (200, 25.9 s); kill the server; start a fresh process with
+    `ASK_TTL_S=45`; follow-up on the original id: **200** in 9.7 s, same
+    scene ("Yes, there is a cat at your 11 o'clock… next to the office
+    chair").
+  - Follow-up at 38 s of 45: 200.
+  - After the chain passed its TTL: **410**
+    `{"detail":"that ask has expired or is unknown — please ask again as a new question"}`.
+  - Media left on disk: 0; cache files: 0.
+- Eval `20261028-121502` (CAPTURE_ENABLED=0): **23/26, 0 errors**. The
+  reds are the known trio (case_02.Q2 accepted, case_07.Q3 literal
+  `middle`, case_13.Q1 `stand`). No new reds.
+
+## Count cap vs live chains (2026-10-28)
+
+- `capture._prune` (newest-50) now skips every folder an unexpired cache
+  entry holds — its own folder or a chain's `media_dir` — using the same
+  `_holders()` rule as `sweep_asks`, and never the folder just created.
+  The store can therefore exceed 50 by the number of live-held folders;
+  they drop back under the cap once their chains expire.
+- The TTL (`ASK_TTL_DEFAULT_S`, `ask_ttl_s()`) moved to `capture.py`
+  so the cap can apply it; `pipeline` re-exports both names.
+- Test: a live chain rooted at the oldest folder, plus 50 newer asks
+  (51 in all, inside the TTL). The root survives with its photo, the
+  folder count stays 50, and `/followup` on the chain returns 200. With
+  the guard removed (scratch copy) the test fails: the root is evicted
+  and the follow-up gets a 410.
+
+## Baseten primary synthesis (2026-10-28)
+
+- First synthesis attempt: Baseten `meta-models/muse-spark-open-1026`
+  (`/chat/completions`, non-streaming, `reasoning_effort="low"`,
+  temperature 0.2), 8 s budget. The retry is contributor Spark with
+  its own 60 s budget, under the same `_run_stage` retry-or-error rule.
+  The preservation check gates both. Log line: `synth_provider`.
+- `BASETEN_ENABLED=0`, or no `BASETEN_API_KEY`, makes both attempts
+  Spark (as before). `BASETEN_SYNTH_MODEL` overrides the model.
+- **Deviation:** `max_tokens` is 2000, not ~1200. Measured: even at
+  "low", reasoning took 630–1340 tokens. At 1200, 1 of 13 calls was
+  cut off with empty content; at 2000, 0 of 8 were.
+- Live: 2.5–4.7 s per call. One rewrite opened with "No, the way is not
+  clear." ahead of the draft's lead, and the lead-first check rejected
+  it.
+- Eval `20261028-151226` (CAPTURE_ENABLED=0): **22/26, 0 errors**. The
+  known trio, plus case_06.Q1 (no "pointed up / sky" orientation line).
+  That line comes from the Spark composition prompt, not from either of
+  these changes: synthesis ran on 0 of 26 questions here (as in every
+  earlier eval). Reran case_06.Q1 alone twice: FAIL, then PASS. This is
+  model variance; the check stays frozen. Note that the eval never
+  exercises synthesis, so Baseten's evidence is offline plus the live
+  probes above.
+
+## Spark synthesis deadline + synthesis-stage eval fixture (2026-10-28)
+
+- Each Spark synthesis attempt now has a **30 s total wall-clock
+  deadline** (`SYNTHESIS_DEADLINE_S`, enforced by `_within`: the call
+  runs on a daemon thread). The per-read HTTP timeout is 30 s too (was
+  60). An attempt still running at 30 s has failed, and the ask errors
+  per the existing rule. The abandoned request ends on its own per-read
+  timeout. Worst case for synthesis is now Baseten 8 s + Spark 30 s.
+  Baseten is unchanged: it is non-streaming, so its 8 s read timeout
+  already covers the whole response.
+- Offline: a trickling Spark (reads keep arriving, so the per-read
+  timeout never fires) fails at the deadline on both attempts →
+  StageFailed; a Spark inside its deadline still serves.
+- Eval: new `cases.json` → `synthesis` section, run in-process against
+  `pipeline.synthesize_answer` with the real providers and graded in the
+  normal report. `synth_tablewalk.Q1` is the recorded Oct 27 table-walk
+  draft, verbatim. That recording ends at "The lawn is at your 12
+  o'clock, far…", so the fixture ends there too; the question wasn't
+  recorded, so the fixture assumes "is the way to the table clear?".
+  Checks: the stage applied, the warning verbatim, the first sentence
+  stays first, patio/table/bench/lawn all kept, output shorter than the
+  draft. The report-only line shows which provider served.
+- Live: 3/3 PASS on Baseten (3.0–4.6 s), 2/2 PASS on Spark with
+  BASETEN_ENABLED=0 (16.4 s, 20.3 s). Output: "Careful — patio is in
+  your path at 1 o'clock. The table is at your 12 o'clock, far. The
+  bench is at your 12 o'clock, far. The lawn is at your 12 o'clock, far."
+- Eval `20261028-154204` (CAPTURE_ENABLED=0): **24/27, 0 errors**,
+  including `synth_tablewalk.Q1` PASS (Baseten, 5.2 s). The reds are
+  the known trio; case_06.Q1 passed this time.
+- That run's output had newlines between sentences (Baseten), which the
+  whitespace-normalized checks let through. Synthesis output is now
+  collapsed to one line. Offline test added; fixture rerun PASS, one line.
+
+## Metric distance (2026-10-28)
+
+### As landed
+- **Pitch sign convention:** `pitch_deg` = degrees the back camera's
+  optical axis points DOWN from horizontal. Level = 0, straight at the
+  floor = 90, up at the sky negative. On Android it comes from the
+  device-frame gravity vector (TYPE_GRAVITY, falling back to the
+  accelerometer): `asin(g_z / |g|)`, sampled at `onCaptureStarted` (the
+  shutter), else at the `takePicture` call. Roll doesn't affect it, but
+  the image is assumed upright.
+- **focal_px derivation** (`CaptureGeometry.focalPx`, computed per photo
+  from the camera actually bound):
+  1. `f_active`: `LENS_INTRINSIC_CALIBRATION` fx when the device reports
+     it, else `f_mm / SENSOR_INFO_PHYSICAL_SIZE.width × PIXEL_ARRAY.width`.
+  2. Stream scale. The ImageCapture stream is bound beside VideoCapture
+     HD, so it comes out 16:9: 1280×720 in sensor orientation, which
+     matches every capture photo at 720×1280. It is the largest centered
+     crop of the active array at the stream's aspect, scaled to the
+     stream. For 16:9 from a 4:3 sensor that is the full width:
+     `scale = 1280 / active.width`.
+  3. × zoom ratio (1.0; the app never zooms).
+  4. × (JPEG long side / CameraX cropRect long side), which is 1.0 when
+     nothing more is cropped. The JPEG is rotated to portrait, never
+     rescaled, and pixels are square, so the same focal_px applies on
+     both axes.
+  - **Principal point:** assumed at the image center.
+  - Every input is logged (`adb logcat -s Alumbra`, line `focal_px=…`).
+    Emulator (Pixel_10 AVD): calibration and spec agree, focal_px 1914
+    for a 1856×1392 stream. **The Pixel 9a values are not yet read off
+    the device** (no phone on adb this session).
+- **Prior table:** door 2.03 m, person 1.70 m, car 1.50 m, matched by
+  head noun ("wooden door", "doors"). Nothing else.
+- **Gates:**
+  - ground: depression ≥ 5°, base not within 3 px of the frame bottom,
+    result in [0.3, 12] m;
+  - prior: box not within 3 px of the frame top or bottom, same range;
+  - reconcile: within 40% of the ground value → ground, `both`; beyond
+    that → ground, with `disagree` logged.
+- **Floor-standing** = not a surface or ground cover, not resting on a
+  holder, and inside the existing rule-2 floor band
+  (`_stands_on_floor`). Ground-plane estimates are made only for those,
+  so "disagree, not floor-standing → drop" can't fire. Consequence: a
+  floor object whose base sits above the band for its size label (for
+  example a big object far away at a level pitch) gets no ground value
+  and keeps its label. I kept this deliberately; a looser rule gives
+  wall-mounted things floor distances.
+- `CAM_HEIGHT_M` (default 1.3) and `METRIC_DISTANCE_ENABLED=0` (kill
+  switch) are honored.
+
+### Speech
+- Bands: < 0.4 m "within arm's reach"; < 0.7 "about half a meter
+  away"; ≤ 3 m nearest half meter ("about 2 and a half meters away");
+  beyond, nearest meter.
+- Used by the path lead, the goal line, "how far" and "On the way", via
+  one `_dist_words`: meters when there is a distance, the label
+  otherwise. Never both for one object.
+- Spark's scene shows the spoken words under `distance` in place of
+  `size_class` and the float. The find flow is untouched (`_prompt_scene`
+  returns its scene as-is).
+- On-path objects are ordered nearest-first when every one has a
+  distance; hazards likewise. Neither changes what is on the path.
+- Synthesis must-keep: the set of distance phrases in the output must
+  equal the draft's, so none are dropped, re-rounded or invented. They
+  are also listed in MUST KEEP.
+
+### Old-app identity
+- No fields → `camera None`: `apply_distances` returns the same scene
+  objects, there is no `goal_distance_m` or `distance_m`, and the log
+  line and `request.json` gain no keys. Offline e2e: the table walk with
+  no metadata is word-for-word today's answer.
+- Clip asks don't send the fields yet; their photo is a frame taken from
+  the video, a different capture path.
+
+### Verification
+- Offline: 243 checks.
+  - Geometry: level 2.0 m within ±0.05; pitched 35°/1.0, 30°/3.0,
+    45°/1.5 and 10°/6.0 exact to 2 dp; camera height scaling.
+  - Gates: φ < 5°, bottom-clipped, > 12 m, < 0.3 m / past straight
+    down.
+  - Door prior at 4.0 m; prior table and clipping.
+  - Reconcile: all four branches; rounding bands; parse; CAM_HEIGHT_M.
+  - Per instance: chair 2.0 m by ground; mug on a table and the wall
+    get no metric; door at 2.5 m from both; door disagreement logged.
+  - Old app, kill switch, nearest-first ordering for path and hazards,
+    "distance never gates", Spark scene, find untouched, synthesis
+    must-keep.
+  - e2e with and without metadata; route parse/record and old-app
+    request.json.
+- Emulator end to end on scratch :8124: the app sent
+  `pitch_deg=22.84 focal_px=1914.0`, the server recorded it in
+  `request.json` and the log line, and the answer came back (no floor
+  objects in the emulator's synthetic scene, so `distances: []`).
+- **Not yet run:** the tape-measure check (needs the phone).
+- Eval `20261028-164243` (no metadata, i.e. old-app path;
+  CAPTURE_ENABLED=0): **25/27, 0 errors**. Reds: case_02.Q2 and
+  case_13.Q1 (known). case_07.Q3 passed this time (model variance; the
+  check is unchanged). No `camera` key in any log line. The one "arm's
+  reach" in the run is Spark's own find-flow wording for the glasses
+  ("an arm's reach away"); the metric code did not produce it.
+
+### Device test fix (Oct 29): sideways tap photos
+
+Pixel 9a tap photos arrive at 4000x3000 with EXIF orientation 6, and nothing in the backend applied the tag. Every tap-photo ask was therefore read on its side, which affects boxes, clock positions, the floor band and the new ground geometry. Live, that gave a 3.9 m ghost distance for a bottle on the desk. Clip frames (720x1280, no tag) were never affected. The bug predates the metric work: the ImageCapture setup is unchanged from HEAD.
+
+- `metric.upright_photo` applies the EXIF tag and caps the long side at 1280 (the clip-frame size). An upright in-size upload passes through as the same bytes, so old uploads are unchanged.
+- In `/ask`, the capture saves the upload as received; the pipeline then gets the upright photo, and `focal_px` is scaled by the same factor (2694.1 → 862.1). `request.json` records the camera as sent.
+- `capture.load_ask` normalizes the stored original on a follow-up reload. The function is deterministic, so the reload produces the same pixels.
+- Offline: 251 checks pass with no failures (8 new).
+- Device: pitch is checked (3.3 / 41.6 / 81.9 for level / ~30° / floor) and focal is checked (calibration fx 2694.1 against 2831 from the spec sheet).
+
+### Tape-measure follow-up (Oct 29)
+
+Replaying the live tape tests (phone at ~5 ft, focal 862.1 at 960x1280):
+
+| Placed | Old (h 1.3) | Now (h 1.52) | Spoken now |
+|---|---|---|---|
+| 1 m | 0.75 | 0.88 | about 1 meter |
+| 2 m, try 1 | 1.72, dropped | 2.01 | about 2 meters |
+| 2 m, try 2 | 1.63 | 1.90 | about 2 meters |
+| 3 m | 3.06 | 3.57 | about 4 meters |
+
+- `CAM_HEIGHT_DEFAULT_M` is now 1.52 (Charles's measured holding height). `CAM_HEIGHT_M` still overrides it.
+- The floor test for distances (`_metric_floor`) now only asks whether the box's base sits below the 40% line, whatever its size label. `_stands_on_floor`, which the path verdicts use, is unchanged, so the 2 m try-1 draft stopper now gets a distance but still isn't on the route.
+- `_one_per_box` (IoU ≥ 0.9) keeps the first name when one box comes back under several names. The object stays on the route, so the verdict is unchanged.
+- Not changed: the phantom "phone" (a 36x21 px box at the frame's bottom edge). Whether something counts as a hazard is gate and path logic.
+- Offline: 256 checks pass with no failures.
+
+### Second tape round (Oct 29, 11:34–11:41)
+
+- **Kitchen spoken as "a few steps away" when it was 5–6 m off.** The island's base sat at 32% of the frame, above the 40% line, so it got no metric distance and fell back to the label. `_metric_floor` now uses the horizon the metadata gives, H/2 − f·tan(pitch), and the base must be below it. Replayed, the island gives 4.7 m, spoken "about 5 meters". Risk: an object mounted on a wall with its base below eye level gets a floor distance that's too far.
+- **Same noun, different distances.** `_path_opening` used to merge every same-noun mention into one; it now keeps them separate when their distances differ by more than AGREE_FRAC of the nearer one.
+- **Path misses, not changed (path verdicts are out of scope):**
+  - "cat scratcher ramp" at 0.9 m: the word "ramp" is in the passage words, so it's treated as walkable.
+  - The saucer chair is ruled out as 'elevated' because its base at 45% is under "a few steps away"'s 0.55 line. The "toy" echo of the same box passes under "far"'s 0.4 line and was spoken in its place.
+- **Detection misses:** at 17° pitch the 1 m ramp is cut off at the bottom edge of the frame (expected at 5 ft). At 30° the ramp is clearly visible but the naming pass never listed it.
+- Offline: 259 checks pass with no failures.
+
+### A + B approved (Oct 29) and segmentation fan-out
+
+- **A.** With capture metadata (and metric enabled), `_not_obstruction` takes `camera` and uses `_metric_floor`, which needs the base below the horizon. Without metadata it uses `_stands_on_floor` as before, so old-app and eval behaviour is unchanged.
+- **B.** "ramp" is no longer passable when the name also carries a pet or toy word (`PET_TOY_WORDS`). A wheelchair ramp or a bare ramp stays passable.
+- **Fan-out.** The scene build (`sam_many`) and clip keyframes (`sam_many_images`) were already on a pool, `FANOUT_WORKERS=5`. The remaining work:
+  - Both pools are now sized from `sam_concurrency()` (env `SAM_CONCURRENCY`, default 6).
+  - The floor look's per-region SAM loop, which was sequential, now runs on the same pool and is merged in region order.
+  - The `/responses` and ASR calls go through one `requests.Session`, `_HTTP` (pool_maxsize 32), via `_meta_post`, which logs a `"rate_limited"` JSON line on any 429. Retries still go through `_run_stage`.
+- Offline: 271 checks pass with no failures. The floor-order test was confirmed to fail when results are merged in finish order.
+- Eval, before → after (same day, 8124, CAPTURE_ENABLED=0):
+  - **Before** (20261029-123047): 22 pass, 4 fail, 1 error (a 300 s client timeout).
+  - **After** (20261029-130300): 24 pass, 3 fail (case_02.Q2, case_07.Q3, case_13.Q1, all known), 0 errors.
+  - Median photo-case latency fell from 31 s to 23 s, or 37 s to 23 s by report median. The before run had a slow-API tail (100–300 s on navigation cases). Over Oct 28's runs the median was 36–40 s.
+  - No 429s in the after run's server log (the logging is new, so the before run can't be checked the same way).

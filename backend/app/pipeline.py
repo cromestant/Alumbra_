@@ -20,11 +20,13 @@ import concurrent.futures
 import copy
 import io
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import wave
@@ -34,6 +36,8 @@ from typing import Any
 
 import requests
 from PIL import Image, ImageChops, ImageFilter, ImageStat
+
+from . import capture, metric
 
 # ----------------------------------------------------------------------------
 # Config
@@ -69,6 +73,16 @@ SAM_TIMEOUT = 180
 SPARK_TIMEOUT = 120
 READ_TIMEOUT = 60
 FANOUT_WORKERS = 5
+SAM_CONCURRENCY_DEFAULT = 6
+
+
+def sam_concurrency() -> int:
+    """Bound on concurrent SAM calls per fan-out (env SAM_CONCURRENCY)."""
+    try:
+        n = int(os.environ.get("SAM_CONCURRENCY", SAM_CONCURRENCY_DEFAULT))
+    except ValueError:
+        return SAM_CONCURRENCY_DEFAULT
+    return n if n >= 1 else SAM_CONCURRENCY_DEFAULT
 
 HAZARD_KEYWORDS = ("puddle", "wet patch", "manhole", "stairs")
 
@@ -218,6 +232,12 @@ EXIT_GOAL_ALIASES = ["door", "exit", "doorway", "entrance"]
 PASSABLE_WORDS = {
     "door", "doorway", "exit", "entrance", "entry", "hallway",
     "corridor", "hall", "sidewalk", "path", "road", "ramp",
+}
+# A ramp for a pet or a toy is a thing on the floor, not a way you walk
+# (live 2026-10-29: "cat scratcher ramp" at 0.9 m read as passable).
+PET_TOY_WORDS = {
+    "cat", "cats", "kitten", "dog", "dogs", "puppy", "pet", "pets",
+    "scratcher", "scratching", "toy", "toys", "hamster", "rabbit",
 }
 
 # Rebuild 2026-10-27 — ground cover is what you walk on, never an
@@ -649,11 +669,27 @@ _CLAUSE_CUT_RE = re.compile(
 
 # Answer tightening — final synthesis pass (subtractive only). The old
 # 3 s budget could never succeed (Wonder first byte 20-28 s, measured
-# 2026-10-27), so the draft always shipped. Budget is per read gap;
-# contributor-tier Spark measured 11-46 s for a full rewrite. Baseten
-# Llama is the planned fallback once approved.
-SYNTHESIS_TIMEOUT = 60
+# 2026-10-27), so the draft always shipped. Budget is per read gap.
+# Baseten (verified live 2026-10-28, 2.45 s for a full rewrite) is the
+# first attempt; contributor-tier Spark (11-46 s) is the retry. The
+# HTTP timeout is per read, so a trickling stream once ran 111 s; each
+# Spark attempt also has a TOTAL wall-clock deadline, and one not done
+# by then has failed (the ask errors per the failure rule).
+# BASETEN_ENABLED=0 (or no key) makes both attempts Spark.
+SYNTHESIS_TIMEOUT = 30
+SYNTHESIS_DEADLINE_S = 30
 SYNTHESIS_MODEL = SPARK_MODEL
+BASETEN_API_BASE = "https://inference.baseten.co/v1"
+BASETEN_SYNTH_MODEL = os.environ.get(
+    "BASETEN_SYNTH_MODEL", "meta-models/muse-spark-open-1026")
+BASETEN_SYNTH_TIMEOUT = 8
+# At default reasoning effort the model spends the whole token budget
+# reasoning and returns empty content (verified 2026-10-28). Even at
+# "low" it reasons 630-1340 tokens; at 1200 one call in ~13 was cut off
+# empty (finish_reason length), so the budget has headroom.
+BASETEN_REASONING_EFFORT = "low"
+BASETEN_MAX_TOKENS = 2000
+BASETEN_TEMPERATURE = 0.2
 CLOCK_LIST_RE = re.compile(
     r"((?:\b\d{1,2}\b(?:\s*,)?\s*(?:and\s+)?)+)\s*o'clock",
     re.IGNORECASE,
@@ -663,6 +699,15 @@ CAUTION_RE = re.compile(
     r"uncertain|check with|volunteer|pharmacist)\b",
     re.IGNORECASE,
 )
+METRIC_PHRASE_RE = re.compile(
+    r"within arm's reach|about half a meter|"
+    r"about \d+(?: and a half)? meters?", re.IGNORECASE)
+
+
+def _metric_set(text: str) -> set[str]:
+    return {m.lower() for m in METRIC_PHRASE_RE.findall(text)}
+
+
 SYNTHESIS_STOPWORDS = {
     "what", "when", "where", "which", "while", "who", "whom", "whose",
     "that", "this", "these", "those", "with", "from", "have", "has",
@@ -752,12 +797,34 @@ def _mime_of(data: bytes) -> str:
 # Model API plumbing (streamed POST /responses)
 # ----------------------------------------------------------------------------
 
+# One session for every Meta API call: fan-out threads reuse its pooled
+# connections instead of a TLS handshake per call. The pool is sized
+# above any fan-out so no thread waits on a connection.
+_HTTP = requests.Session()
+_HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=32))
+_HTTP.mount("http://", requests.adapters.HTTPAdapter(pool_maxsize=32))
+
+
+def _meta_post(url: str, **kw: Any) -> requests.Response:
+    """POST to the Meta API on the shared session. A 429 is logged (one
+    JSON line) before the caller turns it into an error and _run_stage
+    retries, so rate limiting is visible in the server log."""
+    resp = _HTTP.post(url, **kw)
+    if resp.status_code == 429:
+        print(json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "rate_limited", "url": url,
+            "retry_after": resp.headers.get("Retry-After"),
+        }), flush=True)
+    return resp
+
+
 def _stream_output_text(body: dict, timeout: int) -> str:
     key = _load_key()
     if not key:
         raise PipelineError("META_MODEL_API_KEY is not set")
     try:
-        resp = requests.post(
+        resp = _meta_post(
             ENDPOINT,
             headers={"Authorization": f"Bearer {key}"},
             json=body,
@@ -901,7 +968,7 @@ def sam_many(image: bytes, phrases: list[str]) -> dict[str, list[dict]]:
             "segmentation", lambda: sam_segment(image, phrase))
 
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=FANOUT_WORKERS
+        max_workers=sam_concurrency()
     ) as pool:
         for phrase, records in pool.map(one, phrases):
             out[phrase] = records
@@ -1044,6 +1111,7 @@ def _not_obstruction(
     goal_aliases: list[str],
     holders: list[Any],
     height: int,
+    camera: dict[str, float] | None = None,
 ) -> str:
     """Rule 2 — why e is not an obstruction ('' when it may be one).
 
@@ -1054,7 +1122,8 @@ def _not_obstruction(
     area — the floor keeps a toy before a couch on-path); surfaces;
     ground cover (patio, lawn, sidewalk...); passageways; objects resting
     on a holder (counter, table, shelf); objects whose base floats above
-    walking height for their distance.
+    walking height for their distance (with capture metadata: whose
+    base is above the horizon).
     """
     name = str(e.get("name", "")).lower()
     if goal is not None and e is goal:
@@ -1071,11 +1140,19 @@ def _not_obstruction(
         return "surface"
     if _has_word(name, GROUND_WORDS):
         return "ground_cover"
-    if _has_word(name, PASSABLE_WORDS):
+    if _has_word(name, PASSABLE_WORDS) and not (
+            _has_word(name, {"ramp", "ramps"})
+            and _has_word(name, PET_TOY_WORDS)):
         return "passage"
     if _rests_on(e, holders):
         return "supported"
-    if not _stands_on_floor(e, height):
+    # With capture metadata the horizon is known, and the floor test is
+    # the same as the distance's: a label-keyed band ruled out a saucer
+    # chair at 45% of a 30 deg-tilted frame while its "toy" echo passed.
+    if camera is not None and metric.enabled() and height > 0:
+        if not _metric_floor(e, height, camera):
+            return "elevated"
+    elif not _stands_on_floor(e, height):
         return "elevated"
     return ""
 
@@ -1165,6 +1242,7 @@ def passage_look(
 def _path_assessment(
     scene: list[dict[str, Any]], question: str, height: int = 0,
     hint: str = "", width: int = 0, openings: list[Any] | None = None,
+    camera: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Facts about the route, computed — not free-reasoned.
 
@@ -1189,22 +1267,36 @@ def _path_assessment(
     h = height or max([int(e["box"][3]) for e in scene] or [1])
     passage, passage_src = _passage(goal, scene, openings or [], w, h)
     goal_size = str(goal.get("size_class", "")) if goal else None
+    goal_dist = goal.get("distance_m") if goal else None
     if passage_src == "opening":
         # Point the user at the way through, not at the leaf.
         goal_clock = clock_of(passage, w)
         goal_size = size_class_of(passage, h)
+        # The opening's base is on the floor by construction.
+        goal_dist = None
+        if camera is not None and metric.enabled():
+            goal_dist = metric.ground_distance(
+                passage, h, camera["pitch_deg"], camera["focal_px"],
+                metric.cam_height_m())
+            goal_dist = None if goal_dist is None else round(goal_dist, 2)
 
     holders = [e.get("box", [0, 0, 0, 0]) for e in scene
                if _has_word(str(e.get("name", "")).lower(), HOLDER_WORDS)]
     on_path = []
     for e in scene:
-        if _not_obstruction(e, goal, g["aliases"], holders, height):
+        if _not_obstruction(e, goal, g["aliases"], holders, height,
+                            camera):
             continue
         if _in_corridor(e, passage, w, h):
             on_path.append(e)
     on_path.sort(key=lambda e: SIZE_RANK.get(
         str(e.get("size_class", "far")), 2))
-    return {
+    on_path = _one_per_box(on_path)
+    if on_path and all("distance_m" in e for e in on_path):
+        # Nearest first when every mention has a distance. Order only:
+        # distance never gates an object in or out of the path.
+        on_path.sort(key=lambda e: float(e["distance_m"]))
+    out = {
         "goal": (str(goal["name"]) if goal else None),
         "goal_clock": goal_clock,
         "goal_size": goal_size,
@@ -1216,10 +1308,15 @@ def _path_assessment(
         "on_path": [
             {"name": str(e.get("name", "")),
              "clock": int(e.get("clock", 12)),
-             "size_class": str(e.get("size_class", ""))}
+             "size_class": str(e.get("size_class", "")),
+             **({"distance_m": e["distance_m"]} if "distance_m" in e
+                else {})}
             for e in on_path
         ],
     }
+    if goal_dist is not None:
+        out["goal_distance_m"] = goal_dist
+    return out
 
 
 def extract_target(question: str) -> str | None:
@@ -1392,7 +1489,7 @@ def transcribe_audio(wav_bytes: bytes | None) -> str:
     key = _load_key()
     if not key:
         raise PipelineError("META_MODEL_API_KEY is not set")
-    r = requests.post(
+    r = _meta_post(
         ASR_ENDPOINT,
         headers={"Authorization": f"Bearer {key}"},
         files={
@@ -1613,6 +1710,101 @@ def entry_for(
     return entry
 
 
+def apply_distances(
+    scene: list[dict[str, Any]],
+    camera: dict[str, float] | None,
+    height: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Metric distance per instance from the app's capture metadata
+    (metric.py). Returns (scene, log). Entries gain distance_m and
+    distance_src when an estimator holds; size_class is untouched (the
+    fallback, and what eval reads). No metadata (old app) or the kill
+    switch: the scene comes back as-is, the same objects."""
+    if camera is None or not metric.enabled():
+        return scene, []
+    cam_h = metric.cam_height_m()
+    holders = [e.get("box", [0, 0, 0, 0]) for e in scene
+               if _has_word(str(e.get("name", "")).lower(), HOLDER_WORDS)]
+    out: list[dict[str, Any]] = []
+    log: list[dict[str, Any]] = []
+    for e in scene:
+        name = str(e.get("name", "")).lower()
+        box = e.get("box")
+        # Surfaces and ground cover are where things stand, not things.
+        if not box or len(box) != 4 or _has_word(name, SURFACE_WORDS) \
+                or _has_word(name, GROUND_WORDS):
+            out.append(e)
+            continue
+        floor = not _rests_on(e, holders) and _metric_floor(e, height,
+                                                           camera)
+        ground = (metric.ground_distance(box, height, camera["pitch_deg"],
+                                         camera["focal_px"], cam_h)
+                  if floor else None)
+        prior = metric.prior_distance(_head_noun(name), box, height,
+                                      camera["focal_px"])
+        d, src, disagreed = metric.reconcile(ground, prior, floor)
+        if ground is not None or prior is not None:
+            rec = {"name": e.get("name"),
+                   "ground_m": None if ground is None else round(ground, 2),
+                   "prior_m": None if prior is None else round(prior, 2),
+                   "distance_m": None if d is None else round(d, 2),
+                   "distance_src": src}
+            if disagreed:
+                rec["disagree"] = True
+            log.append(rec)
+        if d is not None:
+            e = dict(e, distance_m=round(d, 2), distance_src=src)
+        out.append(e)
+    return out, log
+
+
+def _metric_floor(entry: dict[str, Any], height: int,
+                  camera: dict[str, float]) -> bool:
+    """Floor contact for distance only: the base is below the horizon,
+    which the capture metadata places exactly (a fixed band cannot: a
+    phone tilted 33 deg down puts the horizon near the top of the frame).
+    _stands_on_floor's label-keyed band (path verdicts, untouched)
+    dropped a draft stopper at 54% of the frame, and a kitchen island
+    5 m off at 32% kept its wrong "a few steps away" (live 2026-10-29).
+    The ground estimator's 5 deg depression and range gates do the rest."""
+    if height <= 0:
+        return False
+    try:
+        yb = float(entry.get("box", [0, 0, 0, 0])[3])
+    except (TypeError, ValueError, IndexError):
+        return False
+    horizon = height / 2 - camera["focal_px"] * math.tan(
+        math.radians(camera["pitch_deg"]))
+    return yb > horizon
+
+
+def _dist_words(size: str, distance_m: Any = None) -> str:
+    """How far, in words: the metric figure when there is one, else the
+    label. Never both for one object."""
+    if isinstance(distance_m, (int, float)):
+        return metric.spoken(float(distance_m))
+    return DIST_PHRASE.get(size, size or "ahead")
+
+
+def _prompt_scene(scene: list[dict[str, Any]],
+                  kind: str) -> list[dict[str, Any]]:
+    """The scene as Spark sees it. A metric distance replaces the label
+    with its coarse spoken words (Spark must never see 2.13 and say it);
+    the find flow is untouched (separate steer)."""
+    if kind == "find" or not any("distance_m" in e for e in scene):
+        return scene
+    out = []
+    for e in scene:
+        if "distance_m" not in e:
+            out.append(e)
+            continue
+        p = {k: v for k, v in e.items()
+             if k not in ("distance_m", "distance_src", "size_class")}
+        p["distance"] = metric.spoken(float(e["distance_m"]))
+        out.append(p)
+    return out
+
+
 def parse_nouns(raw: str) -> list[str]:
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
@@ -1672,6 +1864,28 @@ def _same_object(a: dict[str, Any], b: dict[str, Any]) -> bool:
     small, big = sorted(({"box": ba}, {"box": bb}), key=_area)
     contained, ratio = _box_pair(small, big)
     return contained >= MERGE_CONTAIN and ratio >= MERGE_AREA_RATIO
+
+
+SAME_BOX_IOU = 0.9
+
+
+def _one_per_box(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One mention per box: SAM can return one box under several names
+    (live 2026-10-29: "scratcher mat", "cat bed" and "mop head" for one
+    draft stopper, spoken as two hazards). The first-listed name stays;
+    the object stays on the route either way."""
+    kept: list[dict[str, Any]] = []
+    for e in entries:
+        try:
+            box = tuple(int(v) for v in e.get("box", []))
+        except (TypeError, ValueError):
+            box = ()
+        if len(box) == 4 and any(
+                iou(box, tuple(int(v) for v in k["box"])) >= SAME_BOX_IOU
+                for k in kept if len(k.get("box", [])) == 4):
+            continue
+        kept.append(e)
+    return kept
 
 
 def merge_entries(scene: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2114,7 +2328,7 @@ def sam_many_images(
         return [(r["box"], r["confidence"]) for r in recs]
 
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=FANOUT_WORKERS
+        max_workers=sam_concurrency()
     ) as pool:
         return list(pool.map(one, frames))
 
@@ -2391,14 +2605,23 @@ def floor_look(
         width, height = im.size
         full = im.convert("RGB")
     found: list[tuple[tuple[int, int, int, int], float | None]] = []
-    for region in _floor_regions(scene, width, height):
+    regions = _floor_regions(scene, width, height)
+
+    def seg(region: tuple[int, int, int, int]) -> list[dict[str, Any]]:
         x0, y0, x1, y1 = region
         crop = full.crop((max(0, x0), max(0, y0),
                           min(width, x1), min(height, y1)))
         buf = io.BytesIO()
         crop.save(buf, format="JPEG", quality=90)
-        recs = _run_stage("floor_look", lambda: sam_segment(
+        return _run_stage("floor_look", lambda: sam_segment(
             buf.getvalue(), FLOOR_PHRASE))
+
+    # Regions segment concurrently; merged in region order, as before.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=sam_concurrency()
+    ) as pool:
+        per_region = list(pool.map(seg, regions))
+    for (x0, y0, _, _), recs in zip(regions, per_region):
         for r in recs:
             try:
                 b = r["box"]
@@ -2566,8 +2789,16 @@ def _is_plural(name: str) -> bool:
         or w in {"people", "feet", "children"}
 
 
-def _where(clock: Any, size: str) -> str:
-    return f"{clock} o'clock, {DIST_PHRASE.get(size, size or 'ahead')}"
+def _where(clock: Any, size: str, distance_m: Any = None) -> str:
+    return f"{clock} o'clock, {_dist_words(size, distance_m)}"
+
+
+def _far_apart(a: Any, b: Any) -> bool:
+    """Two metric distances that cannot be one object (beyond
+    metric.AGREE_FRAC of the nearer). Without both, never apart."""
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    return abs(a - b) > metric.AGREE_FRAC * min(a, b)
 
 
 def _path_opening(a: dict[str, Any]) -> list[str]:
@@ -2579,18 +2810,26 @@ def _path_opening(a: dict[str, Any]) -> list[str]:
     if a["verdict"] == "no_goal_visible":
         return [f"I can't see the {desc} in this photo."]
     # One mention per object: entries sharing a head noun (two ice
-    # boxes SAM did not merge) are one obstacle, at every clock cited.
-    groups: dict[str, dict[str, Any]] = {}
+    # boxes SAM did not merge) are one obstacle, at every clock cited —
+    # unless their metric distances differ beyond metric.AGREE_FRAC
+    # (two cats at 1 m and 3 m are two obstacles, each with its own).
+    groups: list[dict[str, Any]] = []
     for o in a["on_path"]:
-        g = groups.setdefault(_head_noun(o["name"]), {
-            "name": o["name"], "clocks": [], "size_class": o["size_class"]})
+        head, d = _head_noun(o["name"]), o.get("distance_m")
+        g = next((g for g in groups if g["head"] == head
+                  and not _far_apart(g["distance_m"], d)), None)
+        if g is None:
+            g = {"head": head, "name": o["name"], "clocks": [],
+                 "size_class": o["size_class"], "distance_m": d}
+            groups.append(g)
         if _is_plural(o["name"]) and not _is_plural(g["name"]):
             g["name"] = o["name"]
         if o["clock"] not in g["clocks"]:
             g["clocks"].append(o["clock"])
     obs = [dict(g, clock=" and ".join(str(c) for c in g["clocks"]))
-           for g in list(groups.values())[:2]]
-    goal_where = (_where(a["goal_clock"], a.get("goal_size") or "")
+           for g in groups[:2]]
+    goal_where = (_where(a["goal_clock"], a.get("goal_size") or "",
+                         a.get("goal_distance_m"))
                   if a.get("goal") else "")
     way = "the way through the" if a.get("through") else "the way to the"
     if a["verdict"] == "clear":
@@ -2602,10 +2841,11 @@ def _path_opening(a: dict[str, Any]) -> list[str]:
         o = obs[0]
         verb = "are" if _is_plural(o["name"]) else "is"
         lead = (f"Careful — {o['name']} {verb} in your path at "
-                f"{_where(o['clock'], o['size_class'])}.")
+                f"{_where(o['clock'], o['size_class'], o['distance_m'])}.")
     else:
         parts = ", and ".join(
-            f"{o['name']} at {_where(o['clock'], o['size_class'])}"
+            f"{o['name']} at "
+            f"{_where(o['clock'], o['size_class'], o['distance_m'])}"
             for o in obs)
         lead = f"Careful — {parts}, are in your path."
     out = [lead]
@@ -2631,12 +2871,14 @@ def _distance_opening(a: dict[str, Any], question: str) -> list[str]:
                         & PRONOUN_WORDS)
     subj = ("They" if plural else "It") if used_pronoun else f"The {desc}"
     verb = "are" if plural else "is"
-    dist = DIST_PHRASE.get(a.get("goal_size") or "", a.get("goal_size"))
+    dist = (_dist_words(a.get("goal_size") or "", a["goal_distance_m"])
+            if a.get("goal_distance_m") is not None
+            else DIST_PHRASE.get(a.get("goal_size") or "", a.get("goal_size")))
     out = [f"{subj} {verb} {dist}, at your {a['goal_clock']} o'clock."]
     for o in a["on_path"][:1]:
         ov = "are" if _is_plural(o["name"]) else "is"
         out.append(f"On the way, {o['name']} {ov} at your "
-                   f"{_where(o['clock'], o['size_class'])}.")
+                   f"{_where(o['clock'], o['size_class'], o.get('distance_m'))}.")
     return out
 
 
@@ -2730,12 +2972,20 @@ def _tidy(
 
 
 def _hazards_in(scene: list[dict[str, Any]]) -> list[str]:
-    found = []
+    found: list[str] = []
+    near: dict[str, float] = {}
     for ent in scene:
         name = str(ent.get("name", "")).lower()
         for hz in HAZARD_KEYWORDS:
-            if hz in name and hz not in found:
-                found.append(hz)
+            if hz in name:
+                if hz not in found:
+                    found.append(hz)
+                if "distance_m" in ent:
+                    near[hz] = min(near.get(hz, math.inf),
+                                   float(ent["distance_m"]))
+    # Nearest first when every hazard has a distance (order only).
+    if found and all(hz in near for hz in found):
+        found.sort(key=lambda hz: near[hz])
     return found
 
 
@@ -2763,6 +3013,69 @@ def _text_complete(model: str, instruction: str, timeout: int) -> str:
         },
         timeout,
     )
+
+
+def baseten_enabled() -> bool:
+    """Kill switch mirrors synthesis_enabled(): BASETEN_ENABLED=0 off.
+    No key in .env is off too (Spark serves both attempts)."""
+    return os.environ.get("BASETEN_ENABLED", "").strip().lower() not in (
+        "0", "false", "no", "off"
+    ) and bool(_load_secret("BASETEN_API_KEY"))
+
+
+def _baseten_complete(instruction: str, timeout: int) -> str:
+    """Text-only chat completion on Baseten (OpenAI-compatible,
+    non-streaming)."""
+    try:
+        resp = requests.post(
+            f"{BASETEN_API_BASE}/chat/completions",
+            headers={"Authorization":
+                     f"Bearer {_load_secret('BASETEN_API_KEY')}"},
+            json={
+                "model": BASETEN_SYNTH_MODEL,
+                "messages": [{"role": "user", "content": instruction}],
+                "reasoning_effort": BASETEN_REASONING_EFFORT,
+                "max_tokens": BASETEN_MAX_TOKENS,
+                "temperature": BASETEN_TEMPERATURE,
+                "stream": False,
+            },
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        raise PipelineError(f"Baseten unreachable: {e}") from e
+    if resp.status_code != 200:
+        raise PipelineError(
+            f"Baseten HTTP {resp.status_code}: {resp.text[:300]}")
+    try:
+        content = resp.json()["choices"][0]["message"].get("content")
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise PipelineError(f"Baseten bad response: {e}") from e
+    if not (content or "").strip():
+        raise _BadOutput("Baseten returned empty content")
+    return content
+
+
+def _within(deadline_s: float, fn: Any, *args: Any) -> Any:
+    """fn(*args), or PipelineError once deadline_s of wall clock pass.
+
+    The call runs on a daemon thread; past the deadline the ask moves on
+    and the abandoned request dies on its own per-read timeout."""
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn(*args)
+        except BaseException as e:
+            box["error"] = e
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    if worker.is_alive():
+        raise PipelineError(f"no answer within the {deadline_s:g} s deadline")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def _locked_sentences(draft: str) -> list[str]:
@@ -2822,6 +3135,10 @@ def _synthesis_ok(
         if hz.lower() not in ol:
             return False
     if not _clock_set(draft) <= _clock_set(out):
+        return False
+    # A spoken distance is a fact: kept exactly, never re-rounded, never
+    # invented.
+    if _metric_set(draft) != _metric_set(out):
         return False
     for w in subjects:
         if not re.search(r"\b" + re.escape(w) + r"\b", ol):
@@ -2895,6 +3212,7 @@ def synthesize_answer(
     assessment: dict[str, Any] | None,
     hazards: list[str],
     landmarks: list[dict[str, Any]] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> tuple[str, bool, int]:
     """Final synthesis: distill the draft to the answer contract.
 
@@ -2906,7 +3224,8 @@ def synthesize_answer(
     must run: model failure, timeout, or preservation-check failure
     retries once with a fresh budget, then raises StageFailed. The
     unsynthesized draft is never shipped in its place (failure rule,
-    2026-10-27).
+    2026-10-27). The first attempt is Baseten when enabled, the retry
+    contributor Spark; meta["synth_provider"] names the one that served.
     """
     if not synthesis_enabled() or not (question or "").strip():
         return draft, False, 0
@@ -2935,6 +3254,10 @@ def synthesize_answer(
     if clocks:
         facts.append("clock positions cited: " +
                      ", ".join(f"{c} o'clock" for c in clocks))
+    metrics = sorted(_metric_set(draft))
+    if metrics:
+        facts.append("distances cited, keep each exactly: " +
+                     ", ".join(metrics))
     prompt = (
         f"{SYNTHESIS_INSTRUCTION}\n"
         f"QUESTION: {question.strip()}\n"
@@ -2953,10 +3276,21 @@ def synthesize_answer(
         ) and re.sub(r"\s+", " ", text.strip()).startswith(
             re.sub(r"\s+", " ", lead))
 
+    providers = (["baseten"] if baseten_enabled() else []) + \
+        ["spark"] * STAGE_ATTEMPTS
+    served = iter(providers)
+
     def attempt() -> str:
-        out = _text_complete(
-            SYNTHESIS_MODEL, prompt, SYNTHESIS_TIMEOUT
-        ).strip().strip("'\"").strip()
+        provider = next(served)
+        if provider == "baseten":
+            raw = _baseten_complete(prompt, BASETEN_SYNTH_TIMEOUT)
+        else:
+            raw = _within(SYNTHESIS_DEADLINE_S, _text_complete,
+                          SYNTHESIS_MODEL, prompt, SYNTHESIS_TIMEOUT)
+        # One line: Baseten puts newlines between sentences.
+        out = re.sub(r"\s+", " ", raw.strip().strip("'\"").strip())
+        if meta is not None:
+            meta["synth_provider"] = provider
         if ok(out):
             return out
         # Mojibake repair ("â.." for "—"); the fixed text must pass too.
@@ -2975,10 +3309,15 @@ def run_ask(
     media_bytes: bytes | None = None,
     audio_bytes: bytes | None = None,
     trace: dict[str, Any] | None = None,
+    capture_dir: Path | None = None,
+    camera: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: question -> route -> perceive -> gate -> answer.
     trace, when given, receives what the response does not carry (the
-    full uncollapsed scene) for the dev capture store."""
+    full uncollapsed scene) for the dev capture store. capture_dir is
+    this ask's capture folder (store on): its photo/clip back the cached
+    entry on disk. camera: the app's capture metadata (metric.parse_camera),
+    None for an old app."""
     t0 = time.time()
     question = (question or "").strip()
     # Part A — precedence: text -> audio transcript -> clip transcript.
@@ -3026,7 +3365,7 @@ def run_ask(
     result, floor_ran, referent, full_scene = _compose(
         image, scene, question, question_source, question_used,
         flow, target, sam_prompt, qualifier, match, luminance, p85,
-        t0, none_count, ask_id=ask_id,
+        t0, none_count, ask_id=ask_id, camera=camera,
     )
     _store_ask(ask_id, {
         "created": time.time(),
@@ -3044,7 +3383,8 @@ def run_ask(
         "floor_done": floor_ran,
         "read_targets": [resolve_target(question)] if flow == "C" else [],
         "referent": referent,
-    })
+        "camera": camera,
+    }, capture_dir=capture_dir, media_dir=capture_dir)
     if trace is not None:
         trace.update({"ask_id": ask_id, "scene_full": full_scene,
                       "referent": referent})
@@ -3071,6 +3411,7 @@ def _compose(
     followup: bool = False,
     allow_floor_look: bool = True,
     prior_referent: str = "",
+    camera: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], bool, str, list[dict[str, Any]]]:
     """Shared tail: gate -> answer -> post-process -> synthesize -> log.
 
@@ -3079,7 +3420,9 @@ def _compose(
     identically. Follow-ups add prior Q/A context for reference
     resolution. allow_floor_look=False skips the floor second look
     (follow-ups whose media already had it). prior_referent is the
-    previous ask's subject, which a pronoun resolves to. Returns
+    previous ask's subject, which a pronoun resolves to. camera is the
+    app's capture metadata (metric distance); None is today's answers,
+    unchanged. Returns
     (result, floor_ran, referent, scene) so callers can record perception
     state, the subject, and the full scene (every instance — the shipped
     scene_model is collapsed for display) in the cache.
@@ -3107,6 +3450,12 @@ def _compose(
         if floor_new:
             scene = merge_entries(scene + floor_new)
             floor_found = len(floor_new)
+
+    # Metric distance, once, on the final (merged) instances.
+    distance_log: list[dict[str, Any]] = []
+    if camera is not None:
+        with Image.open(io.BytesIO(image)) as im:
+            scene, distance_log = apply_distances(scene, camera, im.size[1])
 
     hazards = _hazards_in(scene)
     street_scene = any(
@@ -3187,7 +3536,8 @@ def _compose(
         assessment = _path_assessment(
             scene, question, height=img_h, hint=prior_referent,
             width=img_w,
-            openings=passage_look(image, scene, question, prior_referent))
+            openings=passage_look(image, scene, question, prior_referent),
+            camera=camera)
         nav_assessment = assessment
         if assessment["goal"] or assessment["verdict"] == "no_goal_visible":
             referent = str(assessment["goal_desc"])
@@ -3199,7 +3549,9 @@ def _compose(
                 opening = ["It's too dark for me to tell whether the way "
                            "ahead is clear."]
             obs = "; ".join(
-                f"{o['name']} at {o['clock']} o'clock, {o['size_class']}"
+                f"{o['name']} at {o['clock']} o'clock, "
+                + (_dist_words("", o["distance_m"]) if "distance_m" in o
+                   else o["size_class"])
                 for o in assessment["on_path"]) or "none"
             extra += (
                 " NAVIGATION: this is a route question. Facts: goal "
@@ -3261,8 +3613,8 @@ def _compose(
         answer, confidence = f"{desc}{CONSUMPTION_TEMPLATE}", 0.4
     else:
         body, confidence = _run_stage("answer", lambda: _spark_answer(
-            image, question, scene, flow, extra, landmarks,
-            allow_empty=bool(opening)))
+            image, question, _prompt_scene(scene, kind), flow, extra,
+            landmarks, allow_empty=bool(opening)))
         # Rule 4: the draft is right before synthesis ever sees it.
         answer = _tidy(opening, body, kind, scene, nav_assessment,
                        hazards, question, count_words)
@@ -3335,10 +3687,11 @@ def _compose(
     # deterministic appends above survive; describe-mode skips inside.
     # Escalations skip it: a polish pass (and its failure) must never
     # stand between the user and the volunteer handoff.
-    synth_applied, synth_ms = False, 0
+    synth_applied, synth_ms, synth_meta = False, 0, {}
     if behavior != "ESCALATE":
         answer, synth_applied, synth_ms = synthesize_answer(
-            answer, question, scene, nav_assessment, hazards, landmarks)
+            answer, question, scene, nav_assessment, hazards, landmarks,
+            synth_meta)
 
     result = {
         "answer": answer,
@@ -3379,11 +3732,15 @@ def _compose(
         "answer": answer[:600],
         "synth_applied": synth_applied,
         "synth_ms": synth_ms,
+        "synth_provider": synth_meta.get("synth_provider"),
         "none_reads": none_count,
         "floor_look": floor_ran,
         "floor_found": floor_found,
         "ask_id": ask_id,
         "followup": followup,
+        # Only with capture metadata: old-app log lines stay as they were.
+        **({"camera": camera, "distances": distance_log}
+           if camera is not None else {}),
     }), flush=True)
     return result, floor_ran, referent, scene
 
@@ -3396,36 +3753,76 @@ class FollowupExpired(Exception):
     """Follow-up references an unknown or expired ask id."""
 
 
-ASK_TTL_S = 900  # 15 minutes: a conversation, not an archive
-ASK_CACHE_MAX = 32
+# The TTL lives with the store, whose count cap must honor it too.
+ASK_TTL_DEFAULT_S = capture.ASK_TTL_DEFAULT_S
+ask_ttl_s = capture.ask_ttl_s
+ASK_CACHE_MAX = 32  # in memory; the disk layer is capped by the captures
 
+# Hot layer. With the capture store on (dev), every entry is also on disk
+# (capture.persist_ask) and survives a restart; with it off (production)
+# the cache is memory-only, exactly as before. Production follow-up
+# persistence is a separate future decision.
 _ASK_CACHE: dict[str, dict[str, Any]] = {}
+
+ASK_EXPIRED_MESSAGE = (
+    "that ask has expired or is unknown — "
+    "please ask again as a new question"
+)
 
 
 def _sweep_asks() -> None:
-    now = time.time()
+    now, ttl = time.time(), ask_ttl_s()
     for key in [k for k, v in _ASK_CACHE.items()
-                if now - v.get("created", 0) > ASK_TTL_S]:
+                if now - v.get("created", 0) > ttl]:
         del _ASK_CACHE[key]
     while len(_ASK_CACHE) > ASK_CACHE_MAX:
         oldest = min(_ASK_CACHE, key=lambda k: _ASK_CACHE[k]["created"])
-        del _ASK_CACHE[oldest]
+        del _ASK_CACHE[oldest]  # still on disk when persisted
+    # Expiry deletes on disk too, store on or off: whatever an earlier
+    # run persisted must not outlive its conversation.
+    capture.sweep_asks(ttl, now)
 
 
-def _store_ask(ask_id: str, entry: dict[str, Any]) -> None:
-    _sweep_asks()
+def _store_ask(
+    ask_id: str, entry: dict[str, Any],
+    capture_dir: Path | None = None, media_dir: Path | None = None,
+) -> None:
+    """Cache an ask. With a capture folder (store on) and the folder
+    holding its photo/clip, the entry is written through to disk; a
+    failed write leaves it memory-only. Written before the sweep: a
+    follow-up whose parent expired while it was being answered must
+    hold the root's media before the sweep looks for holders."""
     _ASK_CACHE[ask_id] = entry
+    if capture_dir is not None and media_dir is not None \
+            and capture.enabled():
+        meta = {k: v for k, v in entry.items()
+                if k not in ("image", "media", "media_dir")}
+        if capture.persist_ask(capture_dir, ask_id, meta, media_dir):
+            entry["media_dir"] = media_dir
+    _sweep_asks()
+
+
+def sweep_ask_store() -> None:
+    """Expire cached asks now (server start: entries that expired while
+    it was down lose their media without waiting for the next ask)."""
+    _sweep_asks()
 
 
 def _load_ask(ask_id: str) -> dict[str, Any]:
+    """The cached ask: memory first, then disk (after a restart or a
+    memory eviction). Unknown, expired, or unreadable is the same 410."""
     _sweep_asks()
-    try:
-        return _ASK_CACHE[ask_id]
-    except KeyError:
-        raise FollowupExpired(
-            "that ask has expired or is unknown — "
-            "please ask again as a new question"
-        )
+    entry = _ASK_CACHE.get(ask_id)
+    if entry is None and capture.enabled():
+        found = capture.load_ask(ask_id)
+        if found is not None \
+                and time.time() - found[0]["created"] <= ask_ttl_s():
+            entry = found[0]
+            entry["media_dir"] = found[1]
+            _ASK_CACHE[ask_id] = entry
+    if entry is None:
+        raise FollowupExpired(ASK_EXPIRED_MESSAGE)
+    return entry
 
 
 PRIOR_CONTEXT_TEMPLATE = (
@@ -3440,6 +3837,7 @@ def run_followup(
     question: str,
     audio_bytes: bytes | None = None,
     trace: dict[str, Any] | None = None,
+    capture_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Follow-up on a cached ask: same media, new question.
 
@@ -3510,6 +3908,7 @@ def run_followup(
         prior_context=prior_context, ask_id=new_id, followup=True,
         allow_floor_look=not floor_done,
         prior_referent=str(entry.get("referent") or ""),
+        camera=entry.get("camera"),
     )
     floor_done = floor_done or floor_ran_now
     _store_ask(new_id, {
@@ -3526,7 +3925,8 @@ def run_followup(
         "floor_done": floor_done,
         "read_targets": read_targets,
         "referent": referent,
-    })
+        "camera": entry.get("camera"),
+    }, capture_dir=capture_dir, media_dir=entry.get("media_dir"))
     if trace is not None:
         trace.update({"ask_id": new_id, "parent_ask_id": ask_id,
                       "scene_full": full_scene, "referent": referent})

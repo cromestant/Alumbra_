@@ -609,5 +609,58 @@
    ]
   }
  ],
+ "synthesis": [
+  {
+   "assessment": {
+    "goal": "table",
+    "goal_clock": 12
+   },
+   "draft": "Careful — patio is in your path at 1 o'clock. The patio is at your 1 o'clock, a few steps away. The table is at your 12 o'clock, far. The bench is at your 12 o'clock, far. The patio ahead is at your 1 o'clock, far. The lawn is at your 12 o'clock, far.",
+   "first_sentence_first": true,
+   "hazards": [],
+   "id": "synth_tablewalk.Q1",
+   "keep": [
+    "patio",
+    "table",
+    "bench",
+    "lawn"
+   ],
+   "landmarks": [
+    "patio",
+    "table",
+    "bench",
+    "lawn"
+   ],
+   "must_apply": true,
+   "question": "is the way to the table clear?",
+   "scene": [
+    {
+     "clock": 1,
+     "name": "patio"
+    },
+    {
+     "clock": 12,
+     "name": "table"
+    },
+    {
+     "clock": 12,
+     "name": "bench"
+    },
+    {
+     "clock": 1,
+     "name": "patio ahead"
+    },
+    {
+     "clock": 12,
+     "name": "lawn"
+    }
+   ],
+   "shorter": true,
+   "source": "live device test 2026-10-27, table walk outdoors (synthesis stalled, the draft shipped; Charles: \"useless\"). Recorded verbatim in the 2026-10-27 review brief, which cut it off after \"The lawn is at your 12 o'clock, far\"; the question was not recorded.",
+   "verbatim": [
+    "Careful — patio is in your path at 1 o'clock."
+   ]
+  }
+ ],
  "version": 1
 }

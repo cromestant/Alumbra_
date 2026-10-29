@@ -1,6 +1,10 @@
 import sys
 sys.path.insert(0, "/home/cromestant/code/alumbra/backend")
 from app import pipeline as p
+from app import capture as _capture
+import tempfile as _tf
+# Never touch the real backend/captures: the cache sweep reads it.
+_capture.CAPTURE_DIR = __import__("pathlib").Path(_tf.mkdtemp())
 
 fails = []
 def check(name, got, want):
@@ -339,6 +343,9 @@ check("tidy surface question keeps ground",
       "A frog is close. You are on a sidewalk.")
 
 # Part 2 — failure rule: retry once with a fresh budget, then error.
+# (Spark-only configuration; Baseten-first is tested below.)
+import os as _os
+_os.environ["BASETEN_ENABLED"] = "0"
 _real_tc = p._text_complete
 _calls = []
 def _stall(model, prompt, timeout):
@@ -386,7 +393,143 @@ check("kill switch is configuration, not failure",
       p.synthesize_answer(_long, "is the way clear?", _scene_tw, None,
                           [])[0], _long)
 del _os.environ["SYNTHESIS_ENABLED"]
+
+# Baseten first, contributor Spark the retry (2026-10-28).
+del _os.environ["BASETEN_ENABLED"]
+_real_bc, _real_secret, _real_post = (p._baseten_complete, p._load_secret,
+                                      p.requests.post)
+p._load_secret = lambda name: "k" if name == "BASETEN_API_KEY" \
+    else _real_secret(name)
+_good = ("Careful — bench is in your path at 12 o'clock. The table, "
+         "lawn and patio are at your 12 and 1 o'clock; the tree at "
+         "your 2 o'clock.")
+_hits = []
+def _route(answers):
+    seq = iter(answers)
+    def bc(prompt, timeout):
+        _hits.append(("baseten", timeout))
+        v = next(seq)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    def tc(model, prompt, timeout):
+        _hits.append((model, timeout))
+        v = next(seq)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    p._baseten_complete, p._text_complete = bc, tc
+_hits.clear(); _route([_good])
+_meta = {}
+_out, _applied, _ = p.synthesize_answer(_long, "is the way clear?",
+                                        _scene_tw, None, [], None, _meta)
+check("baseten: primary, 8 s budget, served",
+      (_hits, _applied, _meta), ([("baseten", 8)], True,
+                                 {"synth_provider": "baseten"}))
+_hits.clear(); _route([_good.replace(". ", ".\n")])
+check("synthesis output is one line (Baseten sends newlines)",
+      p.synthesize_answer(_long, "is the way clear?", _scene_tw, None,
+                          [])[0], _good)
+_hits.clear(); _route([p.PipelineError("Baseten HTTP 503"), _good])
+_meta = {}
+p.synthesize_answer(_long, "is the way clear?", _scene_tw, None, [], None,
+                    _meta)
+check("baseten down: contributor Spark is the retry, own budget",
+      (_hits, _meta["synth_provider"]),
+      ([("baseten", 8), (p.SPARK_MODEL, p.SYNTHESIS_TIMEOUT)], "spark"))
+# The probe's failure: a rewrite that drops a scene landmark ("lawn").
+_no_lawn = ("Careful — bench is in your path at 12 o'clock. The table and "
+            "patio are at your 12 and 1 o'clock; the tree at your 2 o'clock.")
+_hits.clear(); _route([_no_lawn, _good])
+_out, _, _ = p.synthesize_answer(_long, "is the way clear?", _scene_tw,
+                                 None, [], [{"name": "lawn"}])
+check("baseten dropping a landmark fails preservation; Spark retries",
+      (len(_hits), "lawn" in _out), (2, True))
+_hits.clear(); _route([_no_lawn, _no_lawn])
+try:
+    p.synthesize_answer(_long, "is the way clear?", _scene_tw, None, [],
+                        [{"name": "lawn"}])
+    check("both drop the landmark: the ask errors", "shipped", "StageFailed")
+except p.StageFailed as e:
+    check("both drop the landmark: the ask errors", e.stage, "synthesis")
+_os.environ["BASETEN_ENABLED"] = "0"
+_hits.clear(); _route([p.PipelineError("stall"), _good])
+p.synthesize_answer(_long, "is the way clear?", _scene_tw, None, [])
+check("BASETEN_ENABLED=0: Spark serves both attempts",
+      [h[0] for h in _hits], [p.SPARK_MODEL, p.SPARK_MODEL])
+del _os.environ["BASETEN_ENABLED"]
+p._load_secret = lambda name: "" if name == "BASETEN_API_KEY" \
+    else _real_secret(name)
+check("no Baseten key: off", p.baseten_enabled(), False)
+p._load_secret = lambda name: "k" if name == "BASETEN_API_KEY" \
+    else _real_secret(name)
+p._baseten_complete = _real_bc
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body, self.text = status, body, str(body)
+    def json(self):
+        return self._body
+_posted = []
+def _post(url, headers, json, timeout):
+    _posted.append((url, json, timeout))
+    return _resp
+p.requests.post = _post
+_resp = _Resp(200, {"choices": [{"message": {"content": "  ok  "}}]})
+check("baseten request: OpenAI-compatible, required parameters",
+      (p._baseten_complete("hi", 8), _posted[-1][0],
+       {k: _posted[-1][1][k] for k in ("model", "reasoning_effort",
+                                       "max_tokens", "temperature",
+                                       "stream")}),
+      ("  ok  ", "https://inference.baseten.co/v1/chat/completions",
+       {"model": "meta-models/muse-spark-open-1026",
+        "reasoning_effort": "low", "max_tokens": 2000, "temperature": 0.2,
+        "stream": False}))
+_resp = _Resp(200, {"choices": [{"message": {"content": None,
+                                             "reasoning_content": "..."}}]})
+try:
+    p._baseten_complete("hi", 8); _bad = None
+except p._BadOutput:
+    _bad = "BadOutput"
+check("baseten empty content (reasoning ate the budget) is a failure",
+      _bad, "BadOutput")
+_env_model = __import__("subprocess").run(
+    [sys.executable, "-c", "import sys; sys.path.insert(0, %r); "
+     "from app import pipeline; print(pipeline.BASETEN_SYNTH_MODEL)"
+     % str(__import__("pathlib").Path(p.__file__).parent.parent)],
+    env=dict(_os.environ, BASETEN_SYNTH_MODEL="meta-models/other"),
+    capture_output=True, text=True).stdout.strip()
+check("BASETEN_SYNTH_MODEL overrides the model", _env_model,
+      "meta-models/other")
+p.requests.post, p._load_secret = _real_post, _real_secret
+# Spark retry: a total wall-clock deadline, not just the per-read one.
+_os.environ["BASETEN_ENABLED"] = "0"
+_dl = p.SYNTHESIS_DEADLINE_S
+p.SYNTHESIS_DEADLINE_S = 0.3
+_trickle = []
+def _slow(model, prompt, timeout):
+    _trickle.append(timeout)
+    _time_mod.sleep(2)  # reads keep arriving; the per-read timeout never fires
+    return _good
+_time_mod = __import__("time")
+p._text_complete = _slow
+_t = _time_mod.time()
+try:
+    p.synthesize_answer(_long, "is the way clear?", _scene_tw, None, [])
+    _dl_res = "shipped"
+except p.StageFailed as e:
+    _dl_res = e.stage
+check("spark past its total deadline fails; the ask errors after retry",
+      (_dl_res, len(_trickle), _time_mod.time() - _t < 1.5),
+      ("synthesis", 2, True))
+p._text_complete = lambda m, pr, t: _good
+check("spark inside its deadline still serves",
+      p.synthesize_answer(_long, "is the way clear?", _scene_tw, None, [])[1],
+      True)
+p.SYNTHESIS_DEADLINE_S = _dl
+check("spark deadline is 30 s total", p.SYNTHESIS_DEADLINE_S, 30)
+del _os.environ["BASETEN_ENABLED"]
 p._text_complete = _real_tc
+_os.environ["BASETEN_ENABLED"] = "0"  # offline below: never the network
 
 # Other stages: segmentation, crop reads, ASR, Jev error after retry.
 _real_seg = p.sam_segment
@@ -403,6 +546,8 @@ class _R:
     status_code = 500
     text = "boom"
 p.requests.post = lambda *a, **k: _R()
+_real_http_post = p._HTTP.post
+p._HTTP.post = lambda *a, **k: _R()
 try:
     p.transcribe_question(b"RIFF....WAVE")
     check("ASR failure errors", "silent ''", "StageFailed")
@@ -420,6 +565,7 @@ p.jev_enabled = lambda: False
 check("Jev disabled is configuration", p.jev_intents("state"), None)
 p.jev_enabled = _real_jev
 p.requests.post = _real_post
+p._HTTP.post = _real_http_post
 
 # End to end through _compose / run_followup (models stubbed, no
 # network): the leads Charles hears on device.
@@ -764,6 +910,313 @@ check("pan: a known shift is found",
       p._pan(p._thumb(_crop_jpeg(100), (64, 96)),
              p._thumb(_crop_jpeg(164), (64, 96))), (10, 0))
 
+# Metric distance (2026-10-28): geometry from the app's capture
+# metadata. pitch_deg = degrees the optical axis points DOWN from level;
+# focal_px in upload pixels; principal point at the image center.
+from app import metric as _m
+import math as _math
+# A tap photo as the Pixel 9a stores it: 4000x3000 sensor pixels, EXIF
+# orientation 6 (display = raw turned 90 deg clockwise). A bright block
+# at the raw top-left belongs at the upright top-right.
+_raw = _Image.new("RGB", (4000, 3000), (0, 0, 0))
+_raw.paste((255, 255, 255), (0, 0, 400, 300))
+_ex = _Image.Exif()
+_ex[274] = 6
+_b = _io.BytesIO()
+_raw.save(_b, format="JPEG", exif=_ex)
+_sideways = _b.getvalue()
+_up, _sc = _m.upright_photo(_sideways)
+_upi = _Image.open(_io.BytesIO(_up))
+check("upright: sideways 4000x3000 -> upright 960x1280, scale 0.32, "
+      "no rotate tag left",
+      (_upi.size, _sc, _upi.getexif().get(274, 1)), ((960, 1280), 0.32, 1))
+check("upright: the raw top-left block lands top-right",
+      (_upi.getpixel((930, 30))[0] > 200, _upi.getpixel((30, 30))[0] < 50),
+      (True, True))
+check("upright: an upright 720x1280 frame is the same bytes, scale 1",
+      (lambda r: (r[0] == _live_jpeg, r[1]))(_m.upright_photo(_live_jpeg)),
+      (True, 1.0))
+check("upright: same input -> same pixels (follow-up reload)",
+      _m.upright_photo(_sideways)[0] == _up, True)
+check("upright: unreadable bytes pass through",
+      _m.upright_photo(b"not a jpeg"), (b"not a jpeg", 1.0))
+check("scale_camera: focal follows the pixels, pitch untouched",
+      (_m.scale_camera({"pitch_deg": 30.0, "focal_px": 2694.1}, 0.32),
+       _m.scale_camera(None, 0.32),
+       _m.scale_camera({"pitch_deg": 1.0, "focal_px": 9.0}, 1.0)),
+      ({"pitch_deg": 30.0, "focal_px": 862.1}, None,
+       {"pitch_deg": 1.0, "focal_px": 9.0}))
+_F, _H = 914.0, 1280  # ~Pixel main camera at the 720x1280 upload
+def _y_for(d, pitch, h=1.3, f=_F, H=_H):
+    """Box bottom row that puts a floor contact at d meters."""
+    return H / 2 + f * _math.tan(_math.atan(h / d) - _math.radians(pitch))
+_box = lambda y2: [300, y2 - 200, 420, y2]
+check("ground: level camera, base placed for 2.0 m -> 2.0 +- 0.05",
+      abs(_m.ground_distance(_box(_y_for(2.0, 0)), _H, 0, _F, 1.3) - 2.0)
+      <= 0.05, True)
+for _pitch, _d in ((35, 1.0), (30, 3.0), (45, 1.5), (10, 6.0)):
+    check(f"ground: pitched {_pitch} deg, placed for {_d} m",
+          round(_m.ground_distance(_box(_y_for(_d, _pitch)), _H, _pitch,
+                                   _F, 1.3), 2), _d)
+check("ground: cam height scales the distance",
+      round(_m.ground_distance(_box(_y_for(2.0, 20, h=1.6)), _H, 20, _F,
+                               1.6), 2), 2.0)
+check("gate: depression under 5 deg -> None",
+      _m.ground_distance(_box(_H / 2 + _F * _math.tan(_math.radians(4))),
+                         _H, 0, _F, 1.3), None)
+check("gate: base clipped by the frame bottom -> None",
+      _m.ground_distance(_box(_H - 1), _H, 60, _F, 1.3), None)
+check("gate: beyond 12 m -> None",
+      _m.ground_distance(_box(_y_for(13.5, 0)), _H, 0, _F, 1.3), None)
+check("gate: nearer than 0.3 m (or past straight down) -> None",
+      (_m.ground_distance(_box(_y_for(0.25, 60)), _H, 60, _F, 1.3),
+       _m.ground_distance(_box(1200), _H, 75, _F, 1.3)), (None, None))
+_door_h = 2.03 * _F / 4.0  # a door 4 m away (prior test)
+check("prior: door at a known 4 m",
+      round(_m.prior_distance("door", [200, 300, 500, 300 + _door_h], _H,
+                              _F), 2), 4.0)
+check("prior: v1 table is door/person/car only",
+      (sorted(_m.PRIOR_HEIGHT_M), _m.prior_distance(
+          "bottle", [0, 300, 50, 500], _H, _F)),
+      (["car", "door", "person"], None))
+check("prior: clipped at the top or bottom -> None",
+      (_m.prior_distance("person", [0, 0, 100, 900], _H, _F),
+       _m.prior_distance("person", [0, 200, 100, _H], _H, _F)),
+      (None, None))
+check("reconcile: within 40% keeps ground, src both",
+      _m.reconcile(2.0, 2.6, True), (2.0, "both", False))
+check("reconcile: disagree, floor-standing -> ground",
+      _m.reconcile(2.0, 3.5, True), (2.0, "ground", True))
+check("reconcile: disagree, not floor-standing -> no metric",
+      _m.reconcile(2.0, 3.5, False), (None, None, True))
+check("reconcile: one present -> that one",
+      (_m.reconcile(None, 4.0, False), _m.reconcile(1.2, None, True)),
+      ((4.0, "prior", False), (1.2, "ground", False)))
+check("spoken: coarse rounding bands",
+      [_m.spoken(d) for d in (0.3, 0.5, 0.72, 1.0, 1.3, 2.0, 2.74, 2.76,
+                              3.4, 3.6, 11.5)],
+      ["within arm's reach", "about half a meter away",
+       "about half a meter away", "about 1 meter away",
+       "about 1 and a half meters away", "about 2 meters away",
+       "about 2 and a half meters away", "about 3 meters away",
+       "about 3 meters away", "about 4 meters away",
+       "about 12 meters away"])
+check("parse: both fields, finite, in range; else None",
+      (_m.parse_camera("12.5", "914"), _m.parse_camera(None, "914"),
+       _m.parse_camera("nan", "914"), _m.parse_camera("12", "-1"),
+       _m.parse_camera("95", "914")),
+      ({"pitch_deg": 12.5, "focal_px": 914.0}, None, None, None, None))
+_os.environ["CAM_HEIGHT_M"] = "1.6"
+check("CAM_HEIGHT_M overrides the 1.52 m default", _m.cam_height_m(), 1.6)
+del _os.environ["CAM_HEIGHT_M"]
+
+# Per instance: floor-standing gets ground; on a table / a surface none.
+# These fixtures are placed for a 1.3 m phone height.
+_os.environ["CAM_HEIGHT_M"] = "1.3"
+_cam = {"pitch_deg": 20.0, "focal_px": _F}
+_chair = p.entry_for("office chair", (250, int(_y_for(2.0, 20)) - 420, 470,
+                                      int(_y_for(2.0, 20))), 0.9, 720, _H)
+_mtable = p.entry_for("table", (380, 500, 700, 760), 0.9, 720, _H)
+_mug = p.entry_for("mug", (500, 440, 560, 520), 0.9, 720, _H)
+_mwall = p.entry_for("white wall", (0, 0, 720, 700), 0.9, 720, _H)
+# A door 2.5 m away at 20 deg: its base low enough for the rule-2 floor
+# band (which decides floor-standing), its height matching the prior.
+_dy, _dh = int(_y_for(2.5, 20)), int(2.03 * _F / 2.5)
+_mdoor = p.entry_for("wooden door", (60, _dy - _dh, 240, _dy), 0.9, 720, _H)
+_ms, _mlog = p.apply_distances([_chair, _mtable, _mug, _mwall, _mdoor],
+                               _cam, _H)
+check("instances: chair by ground plane at 2 m",
+      (round(_ms[0]["distance_m"], 1), _ms[0]["distance_src"]),
+      (2.0, "ground"))
+check("instances: mug on the table, the wall: no metric",
+      ("distance_m" in _ms[2], "distance_m" in _ms[3]), (False, False))
+check("instances: size_class untouched",
+      [e["size_class"] for e in _ms],
+      [e["size_class"] for e in (_chair, _mtable, _mug, _mwall, _mdoor)])
+check("instances: door, ground and prior agree -> both, ground value",
+      (_ms[4]["distance_src"], round(_ms[4]["distance_m"], 1)),
+      ("both", 2.5))
+_short = p.entry_for("door", (60, _dy - _dh // 2, 240, _dy), 0.9,
+                     720, _H)  # half the height: the prior says 5 m
+_sd, _slog = p.apply_distances([_short], _cam, _H)
+check("instances: door, estimators disagree -> ground (floor), logged",
+      (_sd[0]["distance_src"], round(_sd[0]["distance_m"], 1),
+       _slog[0].get("disagree"), round(_slog[0]["prior_m"])),
+      ("ground", 2.5, True, 5))
+_plain = [_chair, _mtable]
+check("no metadata: the same scene objects back, no log",
+      (p.apply_distances(_plain, None, _H)[0] is _plain,
+       p.apply_distances(_plain, None, _H)[1]), (True, []))
+_os.environ["METRIC_DISTANCE_ENABLED"] = "0"
+check("kill switch: no distance computed",
+      p.apply_distances(_plain, _cam, _H)[0] is _plain, True)
+del _os.environ["METRIC_DISTANCE_ENABLED"]
+
+# Answers: meters replace the label, nearest first; never both.
+_near = {"name": "box", "box": [450, 650, 550, 700], "confidence": 0.9,
+         "clock": 12, "size_class": "far", "distance_m": 1.3}
+_farb = {"name": "bag", "box": [450, 560, 550, 680], "confidence": 0.9,
+         "clock": 12, "size_class": "close", "distance_m": 3.4}
+_pa = p._path_assessment([_farb, _near], "is the way ahead clear?",
+                         height=1200, width=1000)
+check("path: nearest first when every mention has a distance",
+      [o["name"] for o in _pa["on_path"]], ["box", "bag"])
+check("path lead speaks meters, not labels",
+      p._path_opening(_pa)[0],
+      "Careful — box at 12 o'clock, about 1 and a half meters away, and "
+      "bag at 12 o'clock, about 3 meters away, are in your path.")
+_nod = [{k: v for k, v in e.items() if k != "distance_m"}
+        for e in (_farb, _near)]
+_pa1 = p._path_assessment(_nod, "is the way ahead clear?", height=1200,
+                          width=1000)
+check("path without distances: today's order and labels",
+      ([o["name"] for o in _pa1["on_path"]], p._path_opening(_pa1)[0]),
+      (["bag", "box"], "Careful — bag at 12 o'clock, close, and box at 12 "
+                       "o'clock, far away, are in your path."))
+check("hazards: nearest first when each has a distance",
+      p._hazards_in([{"name": "puddle", "distance_m": 4.0},
+                     {"name": "stairs", "distance_m": 1.0}]),
+      ["stairs", "puddle"])
+check("hazards: order unchanged without distances",
+      p._hazards_in([{"name": "puddle"}, {"name": "stairs"}]),
+      ["puddle", "stairs"])
+check("distance never gates: a far object in the passage is announced",
+      "bag" in [o["name"] for o in p._path_assessment(
+          [dict(_farb, distance_m=11.0)], "is the way ahead clear?",
+          height=1200, width=1000)["on_path"]], True)
+_ps = p._prompt_scene([_near, {"name": "lamp", "size_class": "far"}],
+                      "path")
+check("Spark sees the spoken words, never the float or the label",
+      (_ps[0].get("distance"), "distance_m" in _ps[0],
+       "size_class" in _ps[0], _ps[1]),
+      ("about 1 and a half meters away", False, False,
+       {"name": "lamp", "size_class": "far"}))
+check("find flow: Spark scene untouched",
+      p._prompt_scene([_near], "find")[0], _near)
+_md = ("Careful — box is in your path at 12 o'clock, about 2 meters away. "
+       "The table is at your 12 o'clock, about 4 meters away.")
+check("synthesis must keep each meter figure exactly",
+      (p._synthesis_ok(_md, _md, [], [], None, [], []),
+       p._synthesis_ok(_md, _md.replace("about 4 meters", "about 3 meters"),
+                       [], [], None, [], []),
+       p._synthesis_ok(_md, "Careful — box is in your path at 12 o'clock, "
+                       "about 2 meters away. The table is at your 12 "
+                       "o'clock.", [], [], None, [], [])),
+      (True, False, False))
+
+# End to end: the same table walk with and without capture metadata.
+_os.environ["JEV_GATE_ENABLED"] = "0"
+_os.environ["FLOOR_LOOK_ENABLED"] = "0"
+p._vlm_text = lambda m, img, instr, t: '{"answer": "", "confidence": 0.8}'
+def _walk(camera):
+    return p._compose(
+        _jpeg(200), [dict(_otable), dict(_bench)], "can I get to the table?",
+        "text", "can I get to the table?", "A", None, "", None, None,
+        200.0, 200, 0.0, 0, camera=camera)[0]["answer"]
+_cam12 = {"pitch_deg": 20.0, "focal_px": 900.0}
+check("e2e old app (no metadata): today's labels",
+      _walk(None), "Careful — bench is in your path at 12 o'clock, far "
+                   "away. The table is at your 12 o'clock, far away.")
+check("e2e with metadata: meters from geometry",
+      _walk(_cam12), "Careful — bench is in your path at 12 o'clock, about "
+                     "2 and a half meters away. The table is at your 12 "
+                     "o'clock, about 4 meters away.")
+p._vlm_text = _real_vlm
+del _os.environ["CAM_HEIGHT_M"]
+
+# Tape-measure test 2026-10-29 (Pixel 9a, phone at ~5 ft, uploads
+# 960x1280 after upright_photo, focal 2694.1 x 0.32 = 862.1).
+check("default phone height is 1.52 m", _m.cam_height_m(), 1.52)
+_stopper = dict(p.entry_for("draft stopper", (363, 645, 612, 696), 0.9, 960,
+                            1280), size_class="a few steps away")  # as live
+_tape, _ = p.apply_distances([_stopper],
+                             {"pitch_deg": 33.43, "focal_px": 862.1}, 1280)
+check("tape 2 m: a base at 54% of the frame gets a floor distance "
+      "(was dropped by the path band), ~2.0 m at 1.52 m",
+      (p._stands_on_floor(_stopper, 1280), _tape[0].get("distance_src"),
+       abs(_tape[0].get("distance_m", 0) - 2.0) <= 0.1),
+      (False, "ground", True))
+_live2 = [p.entry_for("tabby cat", (212, 827, 439, 1118), 0.9, 960, 1280),
+          p.entry_for("toy", (919, 605, 960, 647), 0.9, 960, 1280)]
+_c33 = {"pitch_deg": 33.24, "focal_px": 862.1}  # horizon at row 75
+check("metric floor: below the horizon from the metadata, not a band",
+      [p._metric_floor(e, 1280, c) for e, c in (
+          (_live2[0], _c33),
+          (p.entry_for("door", (331, 0, 363, 60), 0.9, 960, 1280), _c33),
+          (p.entry_for("tv", (0, 290, 78, 600), 0.9, 960, 1280),
+           {"pitch_deg": 0.0, "focal_px": 862.1}))],
+      [True, False, False])
+_island = dict(p.entry_for("kitchen island", (577, 158, 960, 406), 0.9,
+                           960, 1280), size_class="a few steps away")
+_isl, _ = p.apply_distances([_island], _c33, 1280)
+check("tape: the kitchen island (base at 32% of the frame, ~5-6 m) gets "
+      "a floor distance, not the label",
+      (_isl[0].get("distance_src"), round(_isl[0].get("distance_m", 0), 1),
+       p._dist_words("a few steps away", _isl[0].get("distance_m"))),
+      ("ground", 4.7, "about 5 meters away"))
+# Path floor test with metadata (approved 2026-10-29): the saucer chair
+# at 45% of a 30 deg-tilted frame was 'elevated' under its label band.
+_saucer = dict(p.entry_for("gray saucer chair", (378, 257, 622, 571), 0.9,
+                           960, 1280), size_class="a few steps away")
+_c30 = {"pitch_deg": 29.87, "focal_px": 862.1}
+check("path floor: saucer chair is an obstruction with metadata, "
+      "'elevated' without (old app unchanged)",
+      (p._not_obstruction(_saucer, None, [], [], 1280, _c30),
+       p._not_obstruction(_saucer, None, [], [], 1280)), ("", "elevated"))
+check("path floor: with metadata, a base above the horizon is elevated",
+      p._not_obstruction(p.entry_for("clock", (400, 40, 460, 60), 0.9,
+                                     960, 1280), None, [], [], 1280, _c30),
+      "elevated")
+_os.environ["METRIC_DISTANCE_ENABLED"] = "0"
+check("path floor: kill switch -> the label band again",
+      p._not_obstruction(_saucer, None, [], [], 1280, _c30), "elevated")
+del _os.environ["METRIC_DISTANCE_ENABLED"]
+_rmp = lambda n: p._not_obstruction(
+    dict(p.entry_for(n, (394, 775, 597, 1046), 0.9, 960, 1280),
+         size_class="a few steps away"), None, [], [], 1280)
+check("ramp: a cat scratcher ramp is an object; a wheelchair ramp and "
+      "a bare ramp stay passable",
+      [_rmp(n) for n in ("cat scratcher ramp", "pet ramp",
+                         "wheelchair ramp", "ramp")],
+      ["", "", "passage", "passage"])
+_pa_r = p._path_assessment(
+    [dict(p.entry_for("cat scratcher ramp", (394, 775, 597, 1046), 0.9, 960,
+                      1280), distance_m=0.9, distance_src="ground")],
+    "is the way clear", 1280, width=960, camera=_c30)
+check("route: the 1 m scratcher ramp is now in the path",
+      (_pa_r["verdict"], [o["name"] for o in _pa_r["on_path"]]),
+      ("blocked", ["cat scratcher ramp"]))
+_two_cats = {"verdict": "blocked", "goal": None, "goal_desc": "way",
+             "on_path": [
+                 {"name": "cat", "clock": 11, "size_class": "far",
+                  "distance_m": 1.0},
+                 {"name": "cat", "clock": 12, "size_class": "far",
+                  "distance_m": 3.0}]}
+_split = " ".join(p._path_opening(_two_cats))
+check("same noun, distances 1 m and 3 m: two mentions, each its own",
+      ("about 1 meter" in _split, "about 3 meters" in _split,
+       "11 and 12" in _split), (True, True, False))
+_two_cats["on_path"][1]["distance_m"] = 1.2
+_one = " ".join(p._path_opening(_two_cats))
+check("same noun, 1.0 m and 1.2 m: still one obstacle at both clocks",
+      ("11 and 12" in _one, _one.count("cat")), (True, 1))
+_sameb = [dict(name="scratcher mat", box=[258, 859, 653, 966]),
+          dict(name="cat bed", box=[257, 858, 654, 966]),
+          dict(name="mop head", box=[257, 858, 654, 967]),
+          dict(name="black cat", box=[456, 512, 722, 728])]
+check("one box, one mention: the first name stays, other objects kept",
+      [e["name"] for e in p._one_per_box(_sameb)],
+      ["scratcher mat", "black cat"])
+_dup_scene = [p.entry_for(n, b, 0.9, 960, 1280) for n, b in (
+    ("scratcher mat", (258, 859, 653, 966)),
+    ("mop head", (257, 858, 654, 967)))]
+_dpa = p._path_assessment(_dup_scene, "is my way clear", 1280, width=960)
+check("route: one draft stopper under two names is one hazard, "
+      "still blocked",
+      (_dpa["verdict"], [o["name"] for o in _dpa["on_path"]]),
+      ("blocked", ["scratcher mat"]))
+del _os.environ["JEV_GATE_ENABLED"], _os.environ["FLOOR_LOOK_ENABLED"]
+
 # Dev capture store: inputs + outcome per ask, failures included,
 # newest CAPTURE_KEEP kept; off in production.
 import asyncio as _asyncio, tempfile as _tempfile, json as _json
@@ -780,7 +1233,7 @@ def _call(path, **kw):
     except Exception as e:
         return None, e
 _real_ask, _real_fu = _main.run_ask, _main.run_followup
-_main.run_ask = lambda img, q, m, a, trace: (
+_main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
     trace.update({"ask_id": "abc", "scene_full": [{"name": "cat"}] * 2}),
     {"answer": "I can see two cats in this photo.", "ask_id": "abc"})[1]
 _ok, _ = _call("/ask", image=_Upload(_io.BytesIO(_live_jpeg), filename="p.jpg"),
@@ -800,14 +1253,54 @@ _e = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "error.json").read_text())
 check("capture: a failed ask is kept with its error",
       (getattr(_err, "status_code", None), _e["status"],
        _e["detail"]["stage"]), (503, 503, "synthesis"))
-_main.run_followup = lambda ask_id, q, a, trace: (
+_main.run_followup = lambda ask_id, q, a, trace, cap=None: (
     trace.update({"ask_id": "def", "parent_ask_id": ask_id}),
     {"answer": "None.", "ask_id": "def"})[1]
 _call("/followup", ask_id="abc", question="how many cups", audio=None)
 _f = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "request.json").read_text())
 check("capture: follow-up names its parent ask",
       (_f["endpoint"], _f["parent_ask_id"]), ("followup", "abc"))
-_main.run_ask = lambda img, q, m, a, trace: {"answer": "x"}
+_cams = []
+_main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
+    _cams.append(camera), {"answer": "x"})[1]
+_call("/ask", image=_Upload(_io.BytesIO(_live_jpeg), filename="p.jpg"),
+      question="q", media=None, audio=None, pitch_deg="22.5",
+      focal_px="914.2")
+_rq = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "request.json")
+                  .read_text())
+check("route: capture metadata parsed, passed on, recorded",
+      (_cams[-1], _rq.get("camera")),
+      ({"pitch_deg": 22.5, "focal_px": 914.2},) * 2)
+_call("/ask", image=_Upload(_io.BytesIO(_live_jpeg), filename="p.jpg"),
+      question="q", media=None, audio=None, pitch_deg=None, focal_px=None)
+_rq = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "request.json")
+                  .read_text())
+check("route: old app (no fields) -> camera None, request.json as before",
+      (_cams[-1], "camera" in _rq), (None, False))
+# Live test 2026-10-29: a Pixel 9a tap photo arrives 4000x3000 with EXIF
+# orientation 6, and was read on its side (a 3.9 m ghost distance).
+_imgs = []
+_main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
+    _imgs.append(img), _cams.append(camera), {"answer": "x"})[1]
+_call("/ask", image=_Upload(_io.BytesIO(_sideways), filename="p.jpg"),
+      question="q", media=None, audio=None, pitch_deg="30",
+      focal_px="2694.1")
+_rq_dir = sorted(_tmp.glob("*/*"))[-1]
+check("route: sideways tap photo -> pipeline gets it upright, 1280 long, "
+      "focal scaled; the capture keeps the original",
+      (_Image.open(_io.BytesIO(_imgs[-1])).size, _cams[-1],
+       (_rq_dir / "photo.jpg").read_bytes() == _sideways,
+       _json.loads((_rq_dir / "request.json").read_text())["camera"]),
+      ((960, 1280), {"pitch_deg": 30.0, "focal_px": 862.1}, True,
+       {"pitch_deg": 30.0, "focal_px": 2694.1}))
+_call("/ask", image=_Upload(_io.BytesIO(_live_jpeg), filename="p.jpg"),
+      question="q", media=None, audio=None, pitch_deg="22.5",
+      focal_px="914.2")
+check("route: an upright in-size upload reaches the pipeline as the "
+      "same bytes, camera unscaled",
+      (_imgs[-1] == _live_jpeg, _cams[-1]),
+      (True, {"pitch_deg": 22.5, "focal_px": 914.2}))
+_main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: {"answer": "x"}
 _keep = _cap.CAPTURE_KEEP
 _cap.CAPTURE_KEEP = 5
 for _ in range(8):
@@ -824,6 +1317,259 @@ check("capture: on by default through the hackathon week",
       <= _cap.CAPTURE_DEFAULT_UNTIL)
 _main.run_ask, _main.run_followup = _real_ask, _real_fu
 __import__("shutil").rmtree(_tmp)
+
+# Follow-up cache on disk (2026-10-28): survives a restart, TTL from
+# ASK_TTL_S (default 3600), expiry deletes media on disk, one copy of
+# each photo/clip, memory-only when the store is off.
+import time as _time
+_EXPIRED = ("that ask has expired or is unknown — "
+            "please ask again as a new question")
+_os.environ["CAPTURE_ENABLED"] = "1"
+_cdir = _Path(_tempfile.mkdtemp())
+_cap.CAPTURE_DIR = _cdir
+_ttl = p.ask_ttl_s()
+check("ask TTL default is an hour", _ttl, 3600.0)
+_root = _cap.begin("ask", "how many cats", image=_live_jpeg, media=b"\x00\x00\x00\x18ftypmp42")
+p._ASK_CACHE.clear()
+p._store_ask("r1", {
+    "created": _time.time(), "image": _live_jpeg, "media": b"clipbytes",
+    "scene": _live_cats, "flow": "A", "target": None,
+    "question": "how many cats", "answer": "two", "behavior": "ANSWER",
+    "floor_done": False, "read_targets": [], "referent": "cat"},
+    capture_dir=_root, media_dir=_root)
+check("persisted next to its capture",
+      sorted(f.name for f in _root.iterdir()),
+      ["cache-r1.json", "clip.mp4", "photo.jpg", "request.json"])
+p._ASK_CACHE.clear()  # restart: fresh process state, same disk
+_re = p._load_ask("r1")
+check("restart: rehydrated from disk, same scene and media",
+      (_re["image"] == _live_jpeg,
+       _re["media"] == b"\x00\x00\x00\x18ftypmp42", _re["scene"] == [
+          dict(e, box=list(e["box"])) for e in _live_cats],
+       _re["question"]), (True, True, True, "how many cats"))
+# Follow-up after the restart, through run_followup (models stubbed).
+_os.environ["JEV_GATE_ENABLED"] = "0"
+p._ASK_CACHE.clear()
+_fu_dir = _cap.begin("followup", "how many cats", parent_ask_id="r1")
+_sam_seen = []
+p.sam_segment = lambda img, phrase: (_sam_seen.append(phrase), [])[1]
+p.clip_frames = lambda media, *a, **k: []  # the stub clip has no video
+p._vlm_text = lambda m, img, instr, t: '{"answer": "", "confidence": 0.8}'
+_r_fu = p.run_followup("r1", "how many cats are there", None, None, _fu_dir)
+check("restart: follow-up on the original id answers from the cached scene",
+      _r_fu["answer"].startswith("I can see two cats"), True)
+_fu_id = _r_fu["ask_id"]
+_fu_rec = _json.loads((_fu_dir / f"cache-{_fu_id}.json").read_text())
+check("follow-up references the root's media, never copies it",
+      (_fu_rec["media_dir"] == str(_root.relative_to(_cdir)),
+       sorted(f.name.split(".")[0] for f in _fu_dir.iterdir())),
+      (True, ["cache-" + _fu_id, "request"]))
+check("exactly one photo on disk for the chain",
+      len(list(_cdir.glob("*/*/photo.*"))), 1)
+p.sam_segment, p._vlm_text = _real_sam, _real_vlm
+p.clip_frames = _real_frames
+def _age(path, secs):
+    rec = _json.loads(path.read_text())
+    rec["created"] = _time.time() - secs
+    path.write_text(_json.dumps(rec))
+# TTL edges on the root (the follow-up entry is aged out of the way).
+_age(_fu_dir / f"cache-{_fu_id}.json", _ttl + 60)
+_age(_root / "cache-r1.json", _ttl - 5)
+p._ASK_CACHE.clear()
+check("TTL - 5s: still a conversation",
+      p._load_ask("r1")["answer"], "two")
+_age(_root / "cache-r1.json", _ttl + 5)
+p._ASK_CACHE.clear()
+try:
+    p._load_ask("r1"); _msg = None
+except p.FollowupExpired as e:
+    _msg = str(e)
+check("TTL + 5s: the same 410 message", _msg, _EXPIRED)
+check("expired: media and cache entry gone from disk",
+      sorted(f.name for f in _root.iterdir()), ["request.json"])
+check("expired follow-up's entry gone too",
+      list(_fu_dir.glob("cache-*")), [])
+# A live follow-up keeps its root's media; when it expires, all go.
+_root2 = _cap.begin("ask", "q", image=_live_jpeg)
+p._store_ask("r2", {"created": _time.time(), "image": _live_jpeg,
+                    "media": None, "scene": [], "question": "q"},
+             capture_dir=_root2, media_dir=_root2)
+_age(_root2 / "cache-r2.json", _ttl + 5)  # expires while f2 is answered
+p._ASK_CACHE["r2"]["created"] = _time.time() - _ttl - 5
+_fu2 = _cap.begin("followup", "q2", audio=b"RIFF0000WAVEfmt ", parent_ask_id="r2")
+p._store_ask("f2", {"created": _time.time(), "image": _live_jpeg,
+                    "media": None, "scene": [], "question": "q2"},
+             capture_dir=_fu2, media_dir=_root2)
+p._sweep_asks()
+check("parent expired mid-answer: the new follow-up still holds its photo",
+      [f.name for f in _root2.glob("photo.*")], ["photo.jpg"])
+_age(_fu2 / "cache-f2.json", _ttl + 5)
+p._ASK_CACHE.clear()
+p._sweep_asks()
+check("chain expired: root photo and follow-up audio gone",
+      (list(_root2.glob("photo.*")), list(_fu2.glob("audio.*"))), ([], []))
+# Failure posture: corrupt entry is an expiry; failed write is memory-only.
+_root3 = _cap.begin("ask", "q", image=_live_jpeg)
+p._store_ask("r3", {"created": _time.time(), "image": _live_jpeg,
+                    "media": None, "scene": []},
+             capture_dir=_root3, media_dir=_root3)
+(_root3 / "cache-r3.json").write_text("{not json")
+p._ASK_CACHE.clear()
+try:
+    p._load_ask("r3"); _msg = None
+except p.FollowupExpired as e:
+    _msg = str(e)
+check("corrupt entry: the same 410", _msg, _EXPIRED)
+_gone = _cdir / "no-such-day" / "no-such-ask"
+p._store_ask("r4", {"created": _time.time(), "image": _live_jpeg,
+                    "media": None, "scene": []},
+             capture_dir=_gone, media_dir=_gone)
+check("failed disk write: the ask still caches in memory",
+      p._load_ask("r4")["created"] > 0, True)
+# Store off: memory-only, exactly as before.
+_os.environ["CAPTURE_ENABLED"] = "0"
+_root5 = _cdir / "off"
+_root5.mkdir()
+p._store_ask("r5", {"created": _time.time(), "image": _live_jpeg,
+                    "media": None, "scene": []},
+             capture_dir=_root5, media_dir=_root5)
+check("store off: nothing written", list(_root5.iterdir()), [])
+p._ASK_CACHE.clear()
+try:
+    p._load_ask("r5"); _msg = None
+except p.FollowupExpired as e:
+    _msg = str(e)
+check("store off: a restart ends the chain (today's behavior)", _msg,
+      _EXPIRED)
+_os.environ["ASK_TTL_S"] = "10"
+p._store_ask("r6", {"created": _time.time() - 20, "image": b"",
+                    "media": None, "scene": []})
+try:
+    p._load_ask("r6"); _msg = None
+except p.FollowupExpired as e:
+    _msg = str(e)
+check("ASK_TTL_S overrides the TTL", (p.ask_ttl_s(), _msg), (10.0, _EXPIRED))
+del _os.environ["ASK_TTL_S"]
+# Count cap vs a live chain: 51 asks inside the TTL, the chain rooted at
+# the oldest folder (root photo held via the follow-up's media_dir).
+__import__("shutil").rmtree(_cdir)
+_cdir = _Path(_tempfile.mkdtemp())
+_cap.CAPTURE_DIR = _cdir
+_os.environ["CAPTURE_ENABLED"] = "1"
+p._ASK_CACHE.clear()
+_croot = _cap.begin("ask", "how many cats", image=_live_jpeg)
+p._store_ask("c0", {
+    "created": _time.time(), "image": _live_jpeg, "media": None,
+    "scene": _live_cats, "flow": "A", "target": None,
+    "question": "how many cats", "answer": "two", "behavior": "ANSWER",
+    "floor_done": False, "read_targets": [], "referent": "cat"},
+    capture_dir=_croot, media_dir=_croot)
+_cfu = _cap.begin("followup", "and now", parent_ask_id="c0")
+p._store_ask("c1", dict(p._ASK_CACHE["c0"], created=_time.time()),
+             capture_dir=_cfu, media_dir=_croot)
+_age(_croot / "cache-c0.json", _ttl + 5)  # root entry expired, chain live
+for _ in range(50):
+    _cap.begin("ask", "q", image=_live_jpeg)
+_left = sorted(_cdir.glob("*/*"))
+check("count cap: a live chain's root survives 51 asks",
+      (len(_left), _croot in _left, _cfu in _left,
+       [f.name for f in _croot.glob("photo.*")]),
+      (_cap.CAPTURE_KEEP, True, True, ["photo.jpg"]))
+p._ASK_CACHE.clear()  # and after a restart, through the route
+p.sam_segment = lambda img, phrase: []
+p.clip_frames = lambda media, *a, **k: []
+p._vlm_text = lambda m, img, instr, t: '{"answer": "", "confidence": 0.8}'
+_cr, _cerr = _call("/followup", ask_id="c1",
+                   question="how many cats are there", audio=None)
+check("count cap: the chain's follow-up still answers (200)",
+      (_cerr, getattr(_cr, "status_code", None)), (None, 200))
+p.sam_segment, p._vlm_text = _real_sam, _real_vlm
+p.clip_frames = _real_frames
+del _os.environ["CAPTURE_ENABLED"]
+del _os.environ["JEV_GATE_ENABLED"]
+__import__("shutil").rmtree(_cdir)
+
+# Segmentation fan-out (2026-10-29): bounded by SAM_CONCURRENCY
+# (default 6), results in phrase / frame / region order, Meta calls on
+# one shared session, 429s logged.
+import threading as _thr, time as _time, random as _rnd, contextlib as _ctx
+_inflight, _peak, _lk = [0], [0], _thr.Lock()
+def _slow_sam(img, phrase):
+    with _lk:
+        _inflight[0] += 1
+        _peak[0] = max(_peak[0], _inflight[0])
+    _time.sleep(_rnd.uniform(0.01, 0.05))
+    with _lk:
+        _inflight[0] -= 1
+    return [{"box": (0, 0, 10, 10), "confidence": 0.9, "tag": phrase}]
+_real_seg2 = p.sam_segment
+p.sam_segment = _slow_sam
+_phr = [f"thing{i}" for i in range(20)]
+_os.environ["SAM_CONCURRENCY"] = "3"
+_peak[0] = 0
+_many = p.sam_many(b"img", _phr)
+check("fan-out: phrase order kept, every phrase answered",
+      (list(_many), [v[0]["tag"] for v in _many.values()]), (_phr, _phr))
+check("fan-out: SAM_CONCURRENCY=3 bounds in-flight calls (and they "
+      "overlap)", (_peak[0] <= 3, _peak[0] > 1), (True, True))
+del _os.environ["SAM_CONCURRENCY"]
+check("fan-out: default 6; a bad value falls back to 6",
+      (p.sam_concurrency(),
+       (_os.environ.__setitem__("SAM_CONCURRENCY", "zero"),
+        p.sam_concurrency())[1]), (6, 6))
+del _os.environ["SAM_CONCURRENCY"]
+_peak[0] = 0
+_frames = [bytes([i]) for i in range(12)]
+p.sam_segment = lambda f, phrase: (_slow_sam(f, phrase), [
+    {"box": (f[0], 0, f[0] + 1, 1), "confidence": 0.5}])[1]
+check("fan-out: keyframes come back in frame order, at most 6 at once",
+      ([r[0][0][0] for r in p.sam_many_images(_frames, "cat")],
+       _peak[0] <= 6), (list(range(12)), True))
+# Floor look: regions segment concurrently, merged in region order.
+_fl_calls = []
+def _region_sam(img, phrase):
+    with _Image.open(_io.BytesIO(img)) as _im:
+        w = _im.size[0]
+    _fl_calls.append(w)
+    _time.sleep(0.1 if w < 500 else 0.0)  # region 0 (400 px) finishes last
+    return [{"box": (5, 5, 400, 300), "confidence": 0.9}]
+p.sam_segment = _region_sam
+_real_vlm2 = p._vlm_text
+p._vlm_text = lambda m, img, instr, t: "box"
+_fl_scene = [p.entry_for("rug", (100, 700, 500, 1000), 0.9, 1000, 1200)]
+_fl = p.floor_look(_jpeg(120), _fl_scene)
+_regs = p._floor_regions(_fl_scene, 1000, 1200)
+check("floor look: one SAM call per region; the first region's find "
+      "is kept first (region order, not finish order)",
+      (len(_fl_calls), _fl[0]["box"][0] if _fl else None),
+      (len(_regs), 5 + max(0, _regs[0][0])))
+p._vlm_text = _real_vlm2
+p.sam_segment = _real_seg2
+# Shared session and 429 logging.
+class _R429:
+    status_code = 429
+    text = "slow down"
+    headers = {"Retry-After": "2"}
+_sess_calls = []
+_real_hp = p._HTTP.post
+p._HTTP.post = lambda url, **k: (_sess_calls.append(url), _R429())[1]
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    try:
+        p._stream_output_text({"model": "m"}, 5)
+    except p.PipelineError as e:
+        _e429 = str(e)
+_line = [l for l in _buf.getvalue().splitlines() if "rate_limited" in l]
+check("session: Meta calls go through the shared session; a 429 is "
+      "logged and still errors",
+      (_sess_calls == [p.ENDPOINT], len(_line),
+       _json.loads(_line[0])["retry_after"] if _line else None,
+       "HTTP 429" in _e429), (True, 1, "2", True))
+p._HTTP.post = _real_hp
+check("session: one pooled session, sized above the fan-out",
+      (isinstance(p._HTTP, p.requests.Session),
+       p._HTTP.get_adapter("https://api.meta.ai")._pool_maxsize
+       >= p.sam_concurrency()), (True, True))
 
 # App wiring
 from app.main import app

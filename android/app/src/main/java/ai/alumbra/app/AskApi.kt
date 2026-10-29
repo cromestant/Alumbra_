@@ -58,7 +58,8 @@ sealed interface AskOutcome {
 
 /**
  * POST {base_url}/ask as multipart: image (required JPEG), question
- * (optional text), audio + media (optional files). POST
+ * (optional text), audio + media (optional files), pitch_deg + focal_px
+ * (optional capture geometry, both or neither). POST
  * {base_url}/followup re-runs the pipeline on a cached ask's media with
  * a new question (no image). Unknown response fields are ignored.
  */
@@ -82,6 +83,7 @@ class AskApi(baseUrl: String) {
         question: String?,
         audio: File?,
         media: File?,
+        meta: CaptureMeta? = null,
         callback: (AskOutcome) -> Unit,
     ) {
         val jpeg = "image/jpeg".toMediaType()
@@ -89,6 +91,11 @@ class AskApi(baseUrl: String) {
             .addFormDataPart("image", image.name, image.asRequestBody(jpeg))
         if (!question.isNullOrBlank()) {
             form.addFormDataPart("question", question)
+        }
+        if (meta != null) {
+            // Capture geometry for metric distance; both or neither.
+            form.addFormDataPart("pitch_deg", meta.pitchField())
+            form.addFormDataPart("focal_px", meta.focalField())
         }
         if (audio != null && audio.exists()) {
             form.addFormDataPart(
@@ -108,7 +115,8 @@ class AskApi(baseUrl: String) {
             url, form.build(),
             "image=${image.name}(${image.length()}B) " +
                 "question=${!question.isNullOrBlank()} " +
-                "audio=${audio?.length()} media=${media?.length()}",
+                "audio=${audio?.length()} media=${media?.length()} " +
+                "pitch_deg=${meta?.pitchField()} focal_px=${meta?.focalField()}",
             mapGone = false,
             callback = callback,
         )
