@@ -52,6 +52,21 @@
             android:visibility="gone" />
 
         <TextView
+            android:id="@+id/row_tag_human"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/tag_esc"
+            android:paddingLeft="10dp"
+            android:paddingTop="4dp"
+            android:paddingRight="10dp"
+            android:paddingBottom="4dp"
+            android:text="@string/tag_volunteer_answer"
+            android:textColor="@color/alumbra_help"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
             android:id="@+id/row_tag_un"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

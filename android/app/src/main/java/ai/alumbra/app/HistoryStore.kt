@@ -18,6 +18,13 @@ data class HistoryRecord(
     val error: String?,
     val errorDetail: String? = null,
     val askId: String? = null,
+    // ESCALATE with a server case: what the Answer screen waits on.
+    val escalationId: String? = null,
+    val escalationPollS: Int = 3,
+    val escalationWindowS: Int = 120,
+    // behavior == VOLUNTEER: a person's answer. answer is then ALWAYS
+    // the attributed line (Spoken.volunteerSays), never the bare reply.
+    val volunteerName: String? = null,
 )
 
 /** Plain-JSON history in internal storage. Newest first. No new deps. */
@@ -62,8 +69,48 @@ object HistoryStore {
             error = error,
             errorDetail = errorDetail,
             askId = askId,
+            escalationId = result?.escalation?.id,
+            escalationPollS = result?.escalation?.pollS ?: 3,
+            escalationWindowS = result?.escalation?.windowS ?: 120,
         )
         records.add(0, record)
+        save(context, records)
+        return record
+    }
+
+    /**
+     * A volunteer's reply, stored as a human answer distinct from AI
+     * answers (behavior VOLUNTEER). The stored text is the attributed
+     * line, so every place that shows or speaks it carries the name.
+     */
+    fun addVolunteer(
+        context: Context,
+        question: String?,
+        volunteer: String,
+        reply: String,
+    ): HistoryRecord {
+        val records = list(context).toMutableList()
+        val now = System.currentTimeMillis()
+        val record = HistoryRecord(
+            id = if (records.any { it.id == now }) now + 1 else now,
+            timestamp = now,
+            question = question,
+            questionSource = null,
+            answer = Spoken.volunteerSays(volunteer, reply),
+            behavior = BEHAVIOR_VOLUNTEER,
+            confidence = null,
+            sceneJson = "[]",
+            error = null,
+            volunteerName = volunteer.trim(),
+        )
+        records.add(0, record)
+        save(context, records)
+        return record
+    }
+
+    const val BEHAVIOR_VOLUNTEER = "VOLUNTEER"
+
+    private fun save(context: Context, records: List<HistoryRecord>) {
         val trimmed = records.take(MAX_RECORDS)
         val arr = JSONArray()
         for (r in trimmed) {
@@ -80,10 +127,13 @@ object HistoryStore {
                     .put("error", r.error ?: JSONObject.NULL)
                     .put("errorDetail", r.errorDetail ?: JSONObject.NULL)
                     .put("askId", r.askId ?: JSONObject.NULL)
+                    .put("escalationId", r.escalationId ?: JSONObject.NULL)
+                    .put("escalationPollS", r.escalationPollS)
+                    .put("escalationWindowS", r.escalationWindowS)
+                    .put("volunteerName", r.volunteerName ?: JSONObject.NULL)
             )
         }
         file(context).writeText(arr.toString())
-        return record
     }
 
     fun list(context: Context): List<HistoryRecord> {
@@ -113,6 +163,12 @@ object HistoryStore {
                         .takeUnless { o.isNull("errorDetail") },
                     askId = o.optString("askId", null)
                         .takeUnless { o.isNull("askId") },
+                    escalationId = o.optString("escalationId", null)
+                        .takeUnless { o.isNull("escalationId") },
+                    escalationPollS = o.optInt("escalationPollS", 3),
+                    escalationWindowS = o.optInt("escalationWindowS", 120),
+                    volunteerName = o.optString("volunteerName", null)
+                        .takeUnless { o.isNull("volunteerName") },
                 )
             }
         } catch (e: Exception) {

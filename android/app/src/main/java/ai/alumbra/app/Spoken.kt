@@ -11,6 +11,30 @@ object Spoken {
         "I'm not sure I can help you, hold on while I try to get a hold " +
             "on someone to help us"
 
+    // Escalation wait (app-side state speech). The fallback wording is
+    // proposed, not locked.
+    const val WAITING_FOR_VOLUNTEER =
+        "Waiting for a volunteer. Tap Stop waiting at any time."
+    const val NO_VOLUNTEER =
+        "I couldn't reach a volunteer this time. You can ask me again, " +
+            "or try a new photo."
+    const val STOPPED_WAITING = "Stopped waiting for a volunteer."
+    fun waitingStatus(remainingS: Int): String =
+        "Waiting for a volunteer · up to ${remainingS / 60}:" +
+            "%02d more".format(remainingS % 60)
+
+    /**
+     * The ONLY way a volunteer's reply becomes text: attribution first,
+     * always. History stores this string, the Answer screen shows it and
+     * speaks it — a reply is never shown or spoken as Alumbra's own.
+     */
+    fun volunteerSays(name: String, reply: String): String {
+        val who = name.trim()
+        val lead = if (who.isEmpty()) "A volunteer says" else
+            "$who, a volunteer, says"
+        return "$lead: ${reply.trim()}"
+    }
+
     const val RECORDING_START = "Recording. Move your phone slowly across " +
         "what you want to ask about."
     const val PHOTO_TAKEN = "Photo taken. Listening for your question."

@@ -2,7 +2,11 @@ package ai.alumbra.app
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.TypedValue
+import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -20,6 +24,14 @@ import androidx.appcompat.app.AppCompatActivity
  * in History. Only "I didn't catch a question" is spoken ahead of the
  * answer, because it carries information the answer does not.
  *
+ * Waiting for a volunteer: a fresh ESCALATE that carries a server case
+ * polls it (poll/window from the server) behind a big Stop waiting
+ * button. A reply opens as its own VOLUNTEER record — labeled, and its
+ * text is the attributed line (Spoken.volunteerSays), so no path shows
+ * or speaks a reply as Alumbra's. No reply in the window: the fallback
+ * line on the Ask screen. No case (kill switch, old server): exactly
+ * the old Keep-waiting/Leave placeholder.
+ *
  * "New question" (and system Back after a fresh or follow-up ask)
  * returns to the Ask screen; opened from History, Back returns there.
  */
@@ -30,6 +42,15 @@ class AnswerActivity : AppCompatActivity() {
     private var escalated: Boolean = false
     private var errored: Boolean = false
     private var preamble: String? = null
+
+    // Volunteer wait: caseId != null while waiting.
+    private val handler = Handler(Looper.getMainLooper())
+    private var api: AskApi? = null
+    private var caseId: String? = null
+    private var waitQuestion: String? = null
+    private var pollMs = 3000L
+    private var deadline = 0L
+    private val pollTick = Runnable { poll() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Prefs.applyTheme(this)
@@ -66,6 +87,14 @@ class AnswerActivity : AppCompatActivity() {
         } else {
             answer = record.answer.orEmpty()
             escalated = record.behavior == "ESCALATE"
+            if (record.behavior == HistoryStore.BEHAVIOR_VOLUNTEER) {
+                // A person answered: labeled as such; the conversation
+                // continues as a new ask, not a follow-up.
+                findViewById<LinearLayout>(R.id.volunteerbox).visibility =
+                    View.VISIBLE
+                findViewById<Button>(R.id.follow_up_button).visibility =
+                    View.GONE
+            }
             if (record.question != null) {
                 questionView.text = record.question
             } else {
@@ -161,26 +190,127 @@ class AnswerActivity : AppCompatActivity() {
         findViewById<Button>(R.id.leave_button).setOnClickListener {
             goToAsk()
         }
+        findViewById<Button>(R.id.stop_waiting_button).setOnClickListener {
+            Haptics.pulse(this)
+            endWaiting(cancel = true)
+            goToAsk(Spoken.STOPPED_WAITING)
+        }
 
+        val resumeAt = savedInstanceState?.getLong(STATE_DEADLINE, 0L) ?: 0L
         Haptics.pulse(this)
         replayAnswer()
+        val caseRecord = record?.takeIf {
+            escalated && !fromHistory && !it.escalationId.isNullOrEmpty()
+        }
+        if (caseRecord != null &&
+            (savedInstanceState == null || resumeAt > 0L)
+        ) {
+            startWaiting(caseRecord, resumeAt, announce = savedInstanceState == null)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Rotation keeps the same wait (same case, same deadline).
+        if (caseId != null) outState.putLong(STATE_DEADLINE, deadline)
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(pollTick)
+        // Leaving (New question, Back) stops the wait server-side too;
+        // a configuration change resumes it instead.
+        if (isFinishing) endWaiting(cancel = true)
         tts.shutdown()
         super.onDestroy()
     }
 
     /** Back to the root Ask screen, clearing answers above it. */
-    private fun goToAsk() {
+    private fun goToAsk(announce: String? = null) {
         tts.stop()
         startActivity(
             Intent(this, MainActivity::class.java).addFlags(
                 Intent.FLAG_ACTIVITY_CLEAR_TOP or
                     Intent.FLAG_ACTIVITY_SINGLE_TOP
-            )
+            ).apply {
+                if (announce != null) {
+                    putExtra(MainActivity.EXTRA_ANNOUNCE, announce)
+                }
+            }
         )
         finish()
+    }
+
+    private fun startWaiting(rec: HistoryRecord, resumeAt: Long, announce: Boolean) {
+        caseId = rec.escalationId
+        waitQuestion = rec.question
+        pollMs = rec.escalationPollS * 1000L
+        deadline = if (resumeAt > 0L) resumeAt else
+            SystemClock.elapsedRealtime() + rec.escalationWindowS * 1000L
+        api = AskApi(Prefs.baseUrl(this))
+        findViewById<LinearLayout>(R.id.btnrow_escalated).visibility =
+            View.GONE
+        findViewById<Button>(R.id.stop_waiting_button).visibility =
+            View.VISIBLE
+        showRemaining()
+        // State speech, after the escalation line and the description.
+        if (announce) tts.speakQueued(Spoken.WAITING_FOR_VOLUNTEER)
+        Log.i(TAG, "waiting on case ${caseId?.take(8)} " +
+            "window=${rec.escalationWindowS}s poll=${rec.escalationPollS}s")
+        handler.postDelayed(pollTick, pollMs)
+    }
+
+    private fun showRemaining() {
+        val left = ((deadline - SystemClock.elapsedRealtime()) / 1000L)
+            .coerceAtLeast(0L).toInt()
+        findViewById<TextView>(R.id.help_status).text =
+            Spoken.waitingStatus(left)
+    }
+
+    private fun poll() {
+        val id = caseId ?: return
+        showRemaining()
+        api?.escalationStatus(id) { st ->
+            runOnUiThread { onStatus(id, st) }
+        }
+    }
+
+    private fun onStatus(id: String, st: EscalationStatus?) {
+        if (caseId != id || isFinishing || isDestroyed) return
+        val reply = st?.reply
+        if (st?.status == "answered" && !reply.isNullOrBlank()) {
+            Log.i(TAG, "case ${id.take(8)} answered")
+            deliver(st.volunteer.orEmpty(), reply)
+            return
+        }
+        val over = SystemClock.elapsedRealtime() >= deadline
+        if (over || st?.status == "expired" || st?.status == "cancelled") {
+            // The server's window closes first (it opened the case before
+            // answering), so a case past our deadline is already expired.
+            Log.i(TAG, "case ${id.take(8)} closed: ${st?.status}")
+            endWaiting(cancel = false)
+            goToAsk(Spoken.NO_VOLUNTEER)
+            return
+        }
+        handler.postDelayed(pollTick, pollMs)
+    }
+
+    /** The reply opens as its own VOLUNTEER record, which speaks itself. */
+    private fun deliver(volunteer: String, reply: String) {
+        endWaiting(cancel = false)
+        val rec = HistoryStore.addVolunteer(this, waitQuestion, volunteer, reply)
+        tts.stop()
+        startActivity(
+            Intent(this, AnswerActivity::class.java)
+                .putExtra(EXTRA_RECORD_ID, rec.id)
+        )
+        finish()
+    }
+
+    private fun endWaiting(cancel: Boolean) {
+        handler.removeCallbacks(pollTick)
+        val id = caseId ?: return
+        caseId = null
+        if (cancel) api?.cancelEscalation(id)
     }
 
     private fun chipFor(entry: SceneEntry): TextView {
@@ -218,6 +348,8 @@ class AnswerActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val TAG = "AlumbraEscalation"
+        private const val STATE_DEADLINE = "wait_deadline"
         const val EXTRA_RECORD_ID = "record_id"
         const val EXTRA_FROM_HISTORY = "from_history"
     }

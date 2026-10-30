@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alumbra Volunteer</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --ink: #f0f3f6; --dim: #9aa4b2;
+    --line: #2a313c; --help: #57c7ff; --ai: #e3b341; --ok: #3fb950;
+    --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .08em; }
+  #state { color: var(--dim); font-size: 14px; }
+  header label { margin-left: auto; color: var(--dim); font-size: 14px; }
+  input, textarea, button { font: inherit; }
+  input, textarea {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 10px;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  h2 { font-size: 14px; letter-spacing: .1em; color: var(--dim); }
+  .case {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; margin-bottom: 16px;
+    display: grid; grid-template-columns: minmax(0, 340px) 1fr; gap: 16px;
+  }
+  @media (max-width: 720px) { .case { grid-template-columns: 1fr; } }
+  .case img {
+    width: 100%; border-radius: 6px; background: #000; display: block;
+  }
+  .q { font-size: 20px; margin: 0 0 6px; }
+  .wait { color: var(--help); font-weight: 600; font-size: 14px; }
+  .muted { color: var(--dim); font-size: 14px; }
+  .ai {
+    border-left: 3px solid var(--ai); padding: 6px 10px; margin: 10px 0;
+    background: rgba(227, 179, 65, .07);
+  }
+  .ai b { color: var(--ai); font-size: 12px; letter-spacing: .08em; }
+  .scene { margin: 4px 0 0; padding-left: 18px; }
+  textarea { width: 100%; min-height: 90px; margin-top: 8px; }
+  button {
+    margin-top: 8px; background: var(--help); color: #00131d; border: 0;
+    border-radius: 6px; padding: 10px 18px; font-weight: 700; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .err { color: var(--bad); font-size: 14px; }
+  .done { grid-template-columns: 120px 1fr; opacity: .85; }
+  .done .q { font-size: 16px; }
+  .tag { font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+  .answered { color: var(--ok); } .expired, .cancelled { color: var(--bad); }
+  .reply { border-left: 3px solid var(--ok); padding: 4px 10px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ALUMBRA · VOLUNTEER</h1>
+  <span id="state">connecting…</span>
+  <label>Your name <input id="name" autocomplete="name" maxlength="60"></label>
+</header>
+<main>
+  <h2>WAITING FOR HELP</h2>
+  <div id="pending"><p class="muted">Nobody is waiting right now.</p></div>
+  <h2>RECENT</h2>
+  <div id="done"><p class="muted">Nothing yet.</p></div>
+</main>
+<script>
+(function () {
+  "use strict";
+  // Demo boundary: one shared token (VOLUNTEER_TOKEN), from ?token= or
+  // asked once, kept for this tab only.
+  var params = new URLSearchParams(location.search);
+  var token = params.get("token") || store("get", "token") || "";
+  if (!token) token = (prompt("Volunteer token") || "").trim();
+  store("set", "token", token);
+  if (params.has("token")) history.replaceState(null, "", location.pathname);
+
+  var nameEl = document.getElementById("name");
+  nameEl.value = store("get", "name") || "";
+  nameEl.addEventListener("input", function () { store("set", "name", nameEl.value); });
+
+  var pendingEl = document.getElementById("pending");
+  var doneEl = document.getElementById("done");
+  var stateEl = document.getElementById("state");
+  var cards = {};  // id -> {el, status}: built once, so typing survives polls
+
+  function store(op, k, v) {
+    try {
+      if (op === "get") return sessionStorage.getItem("alumbra." + k);
+      sessionStorage.setItem("alumbra." + k, v);
+    } catch (e) { return null; }
+  }
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({"X-Volunteer-Token": token}, opts.headers || {});
+    return fetch(path, opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) throw new Error((body && body.detail) || ("HTTP " + r.status));
+        return body;
+      });
+    });
+  }
+
+  function ago(s) {
+    return s < 60 ? s + " s" : Math.floor(s / 60) + " min " + (s % 60) + " s";
+  }
+
+  function photo(c) {
+    var img = el("img");
+    img.alt = "Photo from the person asking";
+    // Header, not ?token=: keeps the token out of the access log.
+    fetch("/v1/escalations/" + c.id + "/photo", {headers: {"X-Volunteer-Token": token}})
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.blob(); })
+      .then(function (b) { img.src = URL.createObjectURL(b); })
+      .catch(function () { img.replaceWith(el("p", "muted", "Photo no longer available.")); });
+    return img;
+  }
+
+  function context(c, box) {
+    if (c.scene && c.scene.length) {
+      box.appendChild(el("div", "muted", "What the AI saw:"));
+      var ul = el("ul", "scene");
+      c.scene.forEach(function (s) { ul.appendChild(el("li", null, s)); });
+      box.appendChild(ul);
+    }
+    if (c.draft) {
+      var ai = el("div", "ai");
+      ai.appendChild(el("b", null, "AI'S DRAFT ANSWER — correct it, don't repeat it"));
+      ai.appendChild(el("div", null, c.draft));
+      box.appendChild(ai);
+    }
+  }
+
+  function pendingCard(c) {
+    var card = el("section", "case");
+    card.appendChild(photo(c));
+    var box = el("div");
+    box.appendChild(el("p", "q", c.question || "(no question heard)"));
+    var wait = el("div", "wait");
+    box.appendChild(wait);
+    context(c, box);
+    var ta = el("textarea");
+    ta.placeholder = "Your reply. It is spoken to them as: <your name>, a volunteer, says: …";
+    ta.setAttribute("aria-label", "Reply");
+    var btn = el("button", null, "Send reply");
+    var err = el("div", "err");
+    btn.onclick = function () {
+      var name = nameEl.value.trim(), text = ta.value.trim();
+      if (!name) { err.textContent = "Add your name first (top right)."; nameEl.focus(); return; }
+      if (!text) { err.textContent = "Write a reply first."; return; }
+      btn.disabled = true; err.textContent = "";
+      api("/v1/escalations/" + c.id + "/reply", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({volunteer: name, reply: text})
+      }).then(poll).catch(function (e) {
+        btn.disabled = false; err.textContent = "Not sent: " + e.message;
+      });
+    };
+    box.appendChild(ta); box.appendChild(btn); box.appendChild(err);
+    card.appendChild(box);
+    return {el: card, wait: wait, status: "pending"};
+  }
+
+  function doneCard(c) {
+    var card = el("section", "case done");
+    card.appendChild(photo(c));
+    var box = el("div");
+    box.appendChild(el("span", "tag " + c.status, c.status.toUpperCase()));
+    box.appendChild(el("p", "q", c.question || "(no question heard)"));
+    if (c.status === "answered") {
+      box.appendChild(el("div", "reply", c.volunteer + ": " + c.reply));
+      box.appendChild(el("div", "muted", "Answered after " + ago(Math.round(c.wait_ms / 1000))));
+    } else if (c.status === "expired") {
+      box.appendChild(el("div", "muted", "Nobody answered within " + ago(c.window_s) + "."));
+    } else {
+      box.appendChild(el("div", "muted", "They stopped waiting after " + ago(c.waiting_s) + "."));
+    }
+    card.appendChild(box);
+    return {el: card, status: c.status};
+  }
+
+  function render(cases) {
+    var seen = {};
+    cases.forEach(function (c) {
+      seen[c.id] = true;
+      var have = cards[c.id];
+      if (have && have.status !== c.status) { have.el.remove(); have = null; }
+      if (!have) {
+        have = cards[c.id] = c.status === "pending" ? pendingCard(c) : doneCard(c);
+      }
+      // Only place a card when it is new or changed section: re-appending
+      // a node on every poll steals focus from the reply being typed.
+      var home = c.status === "pending" ? pendingEl : doneEl;
+      if (have.el.parentNode !== home) {
+        if (home === doneEl) home.insertBefore(have.el, home.firstChild);  // newest first
+        else home.appendChild(have.el);
+      }
+      if (have.wait) {
+        have.wait.textContent = "Waiting " + ago(c.waiting_s) + " · closes in " +
+          ago(Math.max(0, c.window_s - c.waiting_s));
+      }
+    });
+    Object.keys(cards).forEach(function (id) {
+      if (!seen[id]) { cards[id].el.remove(); delete cards[id]; }
+    });
+    [[pendingEl, "Nobody is waiting right now."], [doneEl, "Nothing yet."]].forEach(function (p) {
+      var hasCase = !!p[0].querySelector("section");
+      Array.prototype.forEach.call(p[0].querySelectorAll(":scope > p.muted"), function (n) { n.remove(); });
+      if (!hasCase) p[0].appendChild(el("p", "muted empty", p[1]));
+    });
+  }
+
+  function poll() {
+    return api("/v1/escalations").then(function (body) {
+      render(body.cases || []);
+      var n = (body.cases || []).filter(function (c) { return c.status === "pending"; }).length;
+      stateEl.textContent = n ? n + " waiting" : "connected";
+      document.title = (n ? "(" + n + ") " : "") + "Alumbra Volunteer";
+    }).catch(function (e) {
+      stateEl.textContent = "not connected: " + e.message;
+    });
+  }
+
+  poll();
+  setInterval(poll, 3000);
+})();
+</script>
+</body>
+</html>

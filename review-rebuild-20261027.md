@@ -803,3 +803,14 @@ The field clip at 15:48 took 48 s server-side. Replayed, the stages were: ASR 1.
   - The floor-look overlap was skipped: its SAM is 1.3 s, and the reads are the cost.
 - The same clip now takes 27.8–32.0 s over three runs (it was 48 s).
 - Offline: 287 checks pass with no failures.
+
+## Escalation plumbing (Oct 29, 18:40)
+
+ESCALATE now opens a case a volunteer answers from a LAN console; the app waits, then speaks the reply attributed ("<Name>, a volunteer, says: …").
+
+- Backend: `app/escalation.py` (in-memory cases: pending → answered / expired / cancelled), routes in `main.py`: `GET /v1/escalations`, `POST /v1/escalations/{id}/reply`, `GET /v1/escalations/{id}/photo` (console, token), `GET /v1/escalations/{id}` and `POST …/cancel` (app, case id only), `GET /volunteer`. The case is made in `_compose` after the answer is final, so non-escalation answers never touch it. The ask's log line carries `escalation {id, outcome: pending}`; each transition logs `{ask_id, escalation {id, outcome, wait_ms}}`; `escalation.json` lands in the ask's capture folder. The photo is served from the ask's store entry (upright), not copied.
+- Access: `VOLUNTEER_TOKEN` (.env), a demo boundary, not a security model. No token or `ESCALATION_ENABLED=0` → no case, all routes 404. Window `ESCALATION_WINDOW_S` (default 120), sent in the response. Restart loses pending cases.
+- Android: Answer screen waits on a fresh ESCALATE with a case (status line, 72dp Stop waiting, cancel on leave, survives rotation). Reply → its own VOLUNTEER History record whose text is built only by `Spoken.volunteerSays`; timeout → fallback line on Ask; no case → old placeholder unchanged.
+- Drill (8124): ask 17:54:17 → response + case visible 17:54:52 → reply 17:54:57 → app poll answered 17:54:57. Timeout (40 s window): expired, late reply 409. Kill switch: same response keys minus `escalation`, routes 404.
+- Eval 20261029-180025 (escalation on): 23/26 passed, failures the known case_02.Q2 / case_07.Q3 / case_13.Q1; fridge_ice errored on a jev DNS failure, then failed once on a Baseten floor read ("white oval objects") with Spark slow (median 35 s this run), then passed. Escalation cases all passed. Offline checks 309/309.
+- Not yet run: the phone + laptop drill.

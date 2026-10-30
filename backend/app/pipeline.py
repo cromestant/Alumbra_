@@ -37,7 +37,7 @@ from typing import Any
 import requests
 from PIL import Image, ImageChops, ImageFilter, ImageStat
 
-from . import capture, metric
+from . import capture, escalation, metric
 
 # ----------------------------------------------------------------------------
 # Config
@@ -3865,6 +3865,12 @@ def _compose(
         "ask_id": ask_id,
         "followup": followup,
     }
+    # An escalation becomes a case a volunteer can answer (escalation.py).
+    # Off (kill switch / no token) the response is exactly as before.
+    case = (escalation.create(ask_id, question_used, scene, answer)
+            if behavior == "ESCALATE" else None)
+    if case is not None:
+        result["escalation"] = case
     # Part C — one log line per ask (question text is the user's own
     # words to their own server; keys never appear here).
     # Instances per name ("tortoiseshell cat x2"): a deduplicated list
@@ -3896,6 +3902,8 @@ def _compose(
         "floor_found": floor_found,
         "ask_id": ask_id,
         "followup": followup,
+        **({"escalation": {"id": case["id"], "outcome": "pending",
+                           "wait_ms": None}} if case is not None else {}),
         # Only with capture metadata: old-app log lines stay as they were.
         **({"camera": camera, "distances": distance_log}
            if camera is not None else {}),
@@ -3981,6 +3989,15 @@ def _load_ask(ask_id: str) -> dict[str, Any]:
     if entry is None:
         raise FollowupExpired(ASK_EXPIRED_MESSAGE)
     return entry
+
+
+def case_photo(ask_id: str) -> bytes | None:
+    """The ask's upright photo from its store entry (the volunteer
+    console's view of an escalated case), or None once it is gone."""
+    try:
+        return _load_ask(ask_id)["image"]
+    except FollowupExpired:
+        return None
 
 
 PRIOR_CONTEXT_TEMPLATE = (

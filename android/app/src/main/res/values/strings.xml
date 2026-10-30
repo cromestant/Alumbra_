@@ -64,6 +64,11 @@
     <string name="history_empty">No asks yet.</string>
     <string name="tag_volunteer">VOLUNTEER</string>
     <string name="tag_unanswered">UNANSWERED</string>
+    <string name="tag_volunteer_answer">VOLUNTEER ANSWER</string>
+    <string name="volunteer_answer_title">VOLUNTEER ANSWER · FROM A PERSON</string>
+    <string name="volunteer_answer_description">Answer from a volunteer, a person, not Alumbra</string>
+    <string name="stop_waiting_label">Stop waiting</string>
+    <string name="stop_waiting_description">Stop waiting for a volunteer and go back to the Ask screen</string>
     <string name="history_list_description">Ask history, newest first</string>
 
     <string name="settings_language">Language</string>

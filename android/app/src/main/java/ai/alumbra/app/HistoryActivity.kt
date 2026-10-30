@@ -64,6 +64,12 @@ class HistoryActivity : AppCompatActivity() {
                 } else {
                     View.GONE
                 }
+            view.findViewById<TextView>(R.id.row_tag_human).visibility =
+                if (record.behavior == HistoryStore.BEHAVIOR_VOLUNTEER) {
+                    View.VISIBLE
+                } else {
+                    View.GONE
+                }
             view.findViewById<TextView>(R.id.row_tag_un).visibility =
                 if (record.error != null) View.VISIBLE else View.GONE
             return view

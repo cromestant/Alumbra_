@@ -231,7 +231,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 getString(R.string.followup_button_description)
             statusOnly(Spoken.followupIntro(prior))
         } else {
-            if (savedInstanceState == null &&
+            val line = intent.getStringExtra(EXTRA_ANNOUNCE)
+            if (savedInstanceState == null && line != null) {
+                // Back from a volunteer wait: its outcome, spoken here.
+                announce(line)
+            } else if (savedInstanceState == null &&
                 intent.getBooleanExtra(EXTRA_NEW_QUESTION, false)
             ) {
                 statusOnly(Spoken.BACK_TO_ASK)
@@ -250,7 +254,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // A new question starts empty: a typed question left from the
         // last ask would otherwise be resent silently.
         typeField.setText("")
-        if (followupAskId == null) statusOnly(Spoken.BACK_TO_ASK)
+        val line = intent.getStringExtra(EXTRA_ANNOUNCE)
+        if (line != null) {
+            announce(line)
+        } else if (followupAskId == null) {
+            statusOnly(Spoken.BACK_TO_ASK)
+        }
     }
 
     override fun onResume() {
@@ -1090,5 +1099,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         const val EXTRA_FOLLOWUP_ASK_ID = "followup_ask_id"
         const val EXTRA_FOLLOWUP_QUESTION = "followup_question"
         const val EXTRA_NEW_QUESTION = "new_question"
+        // A line to speak on arrival (a volunteer wait's outcome).
+        const val EXTRA_ANNOUNCE = "announce"
     }
 }

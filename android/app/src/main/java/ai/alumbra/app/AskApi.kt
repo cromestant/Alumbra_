@@ -15,6 +15,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
@@ -37,6 +38,18 @@ data class AskResult(
     val questionUsed: String?,
     val questionSource: String?,
     val askId: String?,
+    // Present only when the server opened a volunteer case (ESCALATE).
+    val escalation: EscalationCase? = null,
+)
+
+/** A volunteer case to wait on: poll every pollS for up to windowS. */
+data class EscalationCase(val id: String, val pollS: Int, val windowS: Int)
+
+/** One poll of a case. reply/volunteer only when status == "answered". */
+data class EscalationStatus(
+    val status: String,
+    val volunteer: String?,
+    val reply: String?,
 )
 
 sealed interface AskOutcome {
@@ -66,6 +79,7 @@ sealed interface AskOutcome {
 class AskApi(baseUrl: String) {
     private val url = baseUrl.trimEnd('/') + "/ask"
     private val followupUrl = baseUrl.trimEnd('/') + "/followup"
+    private val escalationsUrl = baseUrl.trimEnd('/') + "/v1/escalations"
 
     // Eval asks took 8-67s end to end; the Working state is built for it.
     private val client = OkHttpClient.Builder()
@@ -73,6 +87,12 @@ class AskApi(baseUrl: String) {
         .readTimeout(180, TimeUnit.SECONDS)
         .writeTimeout(180, TimeUnit.SECONDS)
         .eventListener(NetEvents())
+        .build()
+
+    // Volunteer-case polls are small and frequent: short timeouts.
+    private val pollClient = client.newBuilder()
+        .readTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
         .build()
 
     @Volatile
@@ -228,6 +248,58 @@ class AskApi(baseUrl: String) {
     }
 
     /**
+     * GET {base_url}/v1/escalations/{id}: the case's status. null on any
+     * failure (network, 404) — the caller keeps polling to its window.
+     */
+    fun escalationStatus(id: String, callback: (EscalationStatus?) -> Unit) {
+        val request = Request.Builder().url("$escalationsUrl/$id").get().build()
+        pollClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.i(NET_TAG, "escalation poll failed: ${e.message}")
+                callback(null)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) {
+                        Log.i(NET_TAG, "escalation poll HTTP ${it.code}")
+                        callback(null)
+                        return
+                    }
+                    callback(try {
+                        val o = JSONObject(it.body?.string().orEmpty())
+                        EscalationStatus(
+                            o.optString("status", "pending"),
+                            o.optString("volunteer", null)
+                                .takeUnless { o.isNull("volunteer") },
+                            o.optString("reply", null)
+                                .takeUnless { o.isNull("reply") },
+                        )
+                    } catch (e: Exception) {
+                        null
+                    })
+                }
+            }
+        })
+    }
+
+    /** POST .../cancel: the user stopped waiting. Fire and forget. */
+    fun cancelEscalation(id: String) {
+        val request = Request.Builder().url("$escalationsUrl/$id/cancel")
+            .post(ByteArray(0).toRequestBody(null)).build()
+        pollClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.i(NET_TAG, "escalation cancel failed: ${e.message}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                Log.i(NET_TAG, "escalation cancel HTTP ${response.code}")
+                response.close()
+            }
+        })
+    }
+
+    /**
      * Abandons the wait client-side. Note: the server may still finish
      * the ask; there is no server-side cancellation in v1.
      */
@@ -303,6 +375,14 @@ class AskApi(baseUrl: String) {
                             .takeUnless { obj.isNull("question_source") },
                         askId = obj.optString("ask_id", null)
                             .takeUnless { obj.isNull("ask_id") },
+                        escalation = obj.optJSONObject("escalation")?.let {
+                            val id = it.optString("id", "")
+                            if (id.isEmpty()) null else EscalationCase(
+                                id,
+                                it.optInt("poll_s", 3).coerceIn(1, 30),
+                                it.optInt("window_s", 120).coerceIn(5, 900),
+                            )
+                        },
                     )
                 )
             } catch (e: Exception) {

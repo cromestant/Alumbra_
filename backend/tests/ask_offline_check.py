@@ -1696,6 +1696,155 @@ check("typed question: no speculative naming, flow A names itself",
 p.transcribe_question, p.name_scene, p.flow_a = _rt, _rn, _rfa
 p._compose = _real_compose
 
+# Escalation plumbing (2026-10-29): case -> console -> reply -> app.
+import asyncio as _aio, tempfile as _tf, io, json, contextlib
+from pathlib import Path as _P
+from fastapi import HTTPException as _HE
+from app import escalation as esc
+from app.main import app as _app
+_ep = {(r.path, sorted(r.methods)[0]): r.endpoint for r in _app.routes
+       if hasattr(r, "methods")}
+def _call(path, method, **kw):
+    try:
+        return _aio.run(_ep[(path, method)](**kw))
+    except _HE as e:
+        return e.status_code
+_os.environ.pop("ESCALATION_ENABLED", None)
+_os.environ.pop("VOLUNTEER_TOKEN", None)
+_real_secret = esc._secret
+esc._secret = lambda name: _os.environ.get(name, "")  # never the real .env
+check("escalation off without a token", (esc.enabled(),
+      esc.create("a1", "q", [], "d")), (False, None))
+check("off: console + poll routes 404",
+      (_call("/volunteer", "GET"),
+       _call("/v1/escalations", "GET", x_volunteer_token=None, token=None),
+       _call("/v1/escalations/{case_id}", "GET", case_id="x")), (404, 404, 404))
+_os.environ["VOLUNTEER_TOKEN"] = "demo-tok"
+_os.environ["ESCALATION_ENABLED"] = "0"
+check("kill switch wins over token", esc.create("a1", "q", [], "d"), None)
+_os.environ.pop("ESCALATION_ENABLED")
+
+# _compose: a crossing ESCALATE carries the case; an ANSWER never does.
+_rsa, _rsyn = p._spark_answer, p.synthesize_answer
+p._spark_answer = lambda *a, **k: ("There is a car at 2 o'clock.", 0.6)
+p.synthesize_answer = lambda ans, *a, **k: (ans, False, 0)
+_sc = [{"name": "car", "clock": 2, "box": [600, 300, 900, 500],
+        "size_class": "far", "confidence": 0.9}]
+def _comp(q):
+    return p._compose(_live_jpeg, [dict(e) for e in _sc], q, "text", q,
+                      "A", None, "", None, None, 120.0, 200.0, _time.time(),
+                      0, ask_id="ask-esc-1", allow_floor_look=False)[0]
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _esc_res = _comp("Can I cross the street here?")
+_line = [json.loads(l) for l in _buf.getvalue().splitlines()
+         if '"question"' in l][-1]
+check("crossing ESCALATE creates a case (id, poll, window)",
+      (_esc_res["behavior"], sorted(_esc_res.get("escalation", {})),
+       _esc_res["escalation"]["window_s"]),
+      ("ESCALATE", ["id", "poll_s", "window_s"], 120))
+check("ask log line carries escalation {id, outcome, wait_ms}",
+      _line.get("escalation"), {"id": _esc_res["escalation"]["id"],
+                                "outcome": "pending", "wait_ms": None})
+with contextlib.redirect_stdout(io.StringIO()):
+    _ans_res = _comp("What is in front of me?")
+check("ANSWER: no escalation field", (_ans_res["behavior"],
+      "escalation" in _ans_res), ("ANSWER", False))
+_os.environ["ESCALATION_ENABLED"] = "0"
+with contextlib.redirect_stdout(io.StringIO()):
+    _off_res = _comp("Can I cross the street here?")
+_os.environ.pop("ESCALATION_ENABLED")
+def _nojev(r):  # the live gate's scores jitter by 0.01 call to call
+    return dict(r, gate=dict(r["gate"], jev=None))
+check("kill switch: ESCALATE response identical apart from the case",
+      _nojev({k: v for k, v in _esc_res.items() if k != "escalation"}),
+      _nojev(_off_res))
+p._spark_answer, p.synthesize_answer = _rsa, _rsyn
+
+# Console + app routes.
+_cid = _esc_res["escalation"]["id"]
+check("console needs the token", (
+      _call("/v1/escalations", "GET", x_volunteer_token=None, token=None),
+      _call("/v1/escalations", "GET", x_volunteer_token="nope", token=None)),
+      (401, 401))
+_lst = _call("/v1/escalations", "GET", x_volunteer_token="demo-tok",
+             token=None)["cases"]
+_c = next(c for c in _lst if c["id"] == _cid)
+check("console case: question, scene with clock, AI draft, pending",
+      (_c["question"], _c["scene"], "volunteer" in _c["draft"].lower(),
+       _c["status"]),
+      ("Can I cross the street here?", ["car at 2 o'clock"], True, "pending"))
+check("console shows only its own ask's fields (no history)",
+      sorted(_c), sorted(["id", "status", "created", "waiting_s", "window_s",
+                          "question", "scene", "draft", "volunteer", "reply",
+                          "wait_ms"]))
+check("app poll while pending: no reply fields",
+      sorted(_call("/v1/escalations/{case_id}", "GET", case_id=_cid)),
+      ["id", "remaining_s", "status", "window_s"])
+check("reply needs name and text", _call(
+      "/v1/escalations/{case_id}/reply", "POST", case_id=_cid,
+      body={"volunteer": " ", "reply": "hi"}, x_volunteer_token="demo-tok",
+      token=None), 400)
+_tmpd = _P(_tf.mkdtemp())
+esc.attach_folder(_cid, _tmpd)
+with contextlib.redirect_stdout(io.StringIO()) as _rb:
+    _call("/v1/escalations/{case_id}/reply", "POST", case_id=_cid,
+          body={"volunteer": "Ana", "reply": "Wait, a car is coming."},
+          x_volunteer_token=None, token="demo-tok")
+_st = _call("/v1/escalations/{case_id}", "GET", case_id=_cid)
+check("answered: app gets name + reply", (_st["status"], _st["volunteer"],
+      _st["reply"]), ("answered", "Ana", "Wait, a car is coming."))
+_ej = json.loads((_tmpd / "escalation.json").read_text())
+check("escalation.json: answered, volunteer, reply, wait_ms, timestamps",
+      (_ej["status"], _ej["volunteer"], _ej["reply"],
+       isinstance(_ej["wait_ms"], int), bool(_ej["created"] and _ej["resolved"])),
+      ("answered", "Ana", "Wait, a car is coming.", True, True))
+check("scene summary: one line per name, clocks left to right",
+      esc.scene_summary([{"name": "trees", "clock": 1}, {"name": "trees",
+                          "clock": 10}, {"name": "car", "clock": 12},
+                         {"name": "trees", "clock": 1}]),
+      ["trees at 10, 1 o'clock", "car at 12 o'clock"])
+check("resolution logged against the ask", json.loads(
+      _rb.getvalue().strip().splitlines()[-1])["escalation"]["outcome"],
+      "answered")
+check("second reply refused (409)", _call(
+      "/v1/escalations/{case_id}/reply", "POST", case_id=_cid,
+      body={"volunteer": "Bo", "reply": "x"}, x_volunteer_token="demo-tok",
+      token=None), 409)
+
+# Window expiry and the app's cancel.
+_os.environ["ESCALATION_WINDOW_S"] = "1"
+with contextlib.redirect_stdout(io.StringIO()):
+    _e2 = esc.create("ask-esc-2", "Can I cross?", _sc, "d")
+    _e3 = esc.create("ask-esc-3", "Can I cross?", _sc, "d")
+    _time.sleep(1.1)
+    _s2 = esc.status(_e2["id"])
+    _c3 = _call("/v1/escalations/{case_id}/cancel", "POST", case_id=_e3["id"])
+_os.environ.pop("ESCALATION_WINDOW_S")
+check("window passes: expired, shown expired to the console",
+      (_s2["status"], next(c["status"] for c in esc.list_cases()
+                           if c["id"] == _e2["id"])), ("expired", "expired"))
+with contextlib.redirect_stdout(io.StringIO()):
+    _e4 = esc.create("ask-esc-4", "Can I cross?", _sc, "d")
+    _c4 = _call("/v1/escalations/{case_id}/cancel", "POST", case_id=_e4["id"])
+check("app cancel: case closes, a late reply is refused",
+      (_c4["status"], _call("/v1/escalations/{case_id}/reply", "POST",
+       case_id=_e4["id"], body={"volunteer": "A", "reply": "x"},
+       x_volunteer_token="demo-tok", token=None)), ("cancelled", 409))
+p._store_ask("ask-esc-1", {"created": _time.time(), "image": _live_jpeg,
+                           "media": None, "scene": []})
+_ph = _call("/v1/escalations/{case_id}/photo", "GET", case_id=_cid,
+            x_volunteer_token=None, token="demo-tok")
+check("console photo: the ask's own image, as JPEG", (
+      getattr(_ph, "media_type", _ph), getattr(_ph, "body", b"")[:3]),
+      ("image/jpeg", b"\xff\xd8\xff"))
+check("expired wait_ms is the window", esc._CASES[_e2["id"]]["wait_ms"],
+      1000)
+check("console page served when on",
+      type(_call("/volunteer", "GET")).__name__, "FileResponse")
+_os.environ.pop("VOLUNTEER_TOKEN")
+esc._secret = _real_secret
+
 # App wiring
 from app.main import app
 routes = sorted({r.path for r in app.routes if hasattr(r, "path")})

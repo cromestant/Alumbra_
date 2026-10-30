@@ -13,16 +13,19 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import (
+    Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile,
+)
+from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import capture, metric
+from . import capture, escalation, metric
 from .pipeline import (
-    FollowupExpired, PipelineError, StageFailed, run_ask, run_followup,
-    sweep_ask_store,
+    FollowupExpired, PipelineError, StageFailed, case_photo, run_ask,
+    run_followup, sweep_ask_store,
 )
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
+CONSOLE_PAGE = Path(__file__).resolve().parent / "static" / "volunteer.html"
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/3gpp", "video/webm"}
 # Failure rule (2026-10-27): a stage that did not run errors the ask
 # (503) with a line the app speaks as-is; the user retries.
@@ -34,6 +37,26 @@ def _stage_failed(e: StageFailed) -> HTTPException:
         "error": "stage_failed", "stage": e.stage,
         "message": TRY_AGAIN, "cause": str(e),
     })
+
+
+def _escalation_on() -> None:
+    """Off (kill switch or no VOLUNTEER_TOKEN): every escalation route
+    is a plain 404."""
+    if not escalation.enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _volunteer(header: str | None, query: str | None) -> None:
+    """The console's shared demo token (header, or ?token= for <img>)."""
+    _escalation_on()
+    if not escalation.token_ok(header or query):
+        raise HTTPException(status_code=401, detail="bad volunteer token")
+
+
+def _attach_case(result: dict, cap: Path | None) -> None:
+    case = result.get("escalation")
+    if case:
+        escalation.attach_folder(case["id"], cap)
 
 
 def create_app() -> FastAPI:
@@ -126,6 +149,7 @@ def create_app() -> FastAPI:
             capture.fail(cap, 500, repr(e))
             raise
         capture.finish(cap, result, trace)
+        _attach_case(result, cap)
         return JSONResponse(content=result)
 
     @app.post("/followup")
@@ -165,7 +189,80 @@ def create_app() -> FastAPI:
             capture.fail(cap, 500, repr(e))
             raise
         capture.finish(cap, result, trace)
+        _attach_case(result, cap)
         return JSONResponse(content=result)
+
+    # ------------------------------------------------------------------
+    # Escalation: volunteer console + the app's wait (escalation.py).
+    # Console routes need VOLUNTEER_TOKEN (a demo boundary, not a
+    # security model); the app's poll/cancel hold only the case id.
+    # ------------------------------------------------------------------
+
+    @app.get("/volunteer")
+    async def volunteer_console() -> FileResponse:
+        _escalation_on()
+        return FileResponse(CONSOLE_PAGE, media_type="text/html")
+
+    @app.get("/v1/escalations")
+    async def escalations_list(
+        x_volunteer_token: str | None = Header(None),
+        token: str | None = Query(None),
+    ) -> dict:
+        _volunteer(x_volunteer_token, token)
+        return {"cases": escalation.list_cases(),
+                "poll_s": escalation.POLL_S}
+
+    @app.get("/v1/escalations/{case_id}/photo")
+    async def escalation_photo(
+        case_id: str,
+        x_volunteer_token: str | None = Header(None),
+        token: str | None = Query(None),
+    ) -> Response:
+        _volunteer(x_volunteer_token, token)
+        ask_id = escalation.ask_id_of(case_id)
+        photo = None
+        if ask_id:
+            photo = await asyncio.to_thread(case_photo, ask_id)
+        if photo is None:
+            raise HTTPException(status_code=404, detail="photo gone")
+        return Response(content=photo, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/escalations/{case_id}/reply")
+    async def escalation_reply(
+        case_id: str,
+        body: dict = Body(...),
+        x_volunteer_token: str | None = Header(None),
+        token: str | None = Query(None),
+    ) -> dict:
+        _volunteer(x_volunteer_token, token)
+        try:
+            case = escalation.reply(case_id, str(body.get("volunteer", "")),
+                                    str(body.get("reply", "")))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except escalation.CaseClosed as e:
+            raise HTTPException(status_code=409,
+                                detail=f"case is {e.args[0]}")
+        if case is None:
+            raise HTTPException(status_code=404, detail="unknown case")
+        return case
+
+    @app.get("/v1/escalations/{case_id}")
+    async def escalation_status(case_id: str) -> dict:
+        _escalation_on()
+        out = escalation.status(case_id)
+        if out is None:
+            raise HTTPException(status_code=404, detail="unknown case")
+        return out
+
+    @app.post("/v1/escalations/{case_id}/cancel")
+    async def escalation_cancel(case_id: str) -> dict:
+        _escalation_on()
+        out = escalation.cancel(case_id)
+        if out is None:
+            raise HTTPException(status_code=404, detail="unknown case")
+        return out
 
     return app
 
