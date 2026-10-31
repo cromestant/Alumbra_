@@ -6,7 +6,8 @@ import android.content.SharedPreferences
 
 /** App settings, persisted in SharedPreferences. */
 object Prefs {
-    const val DEFAULT_BASE_URL = "http://192.168.68.83:8123"
+    const val DEFAULT_BASE_URL = BuildConfig.DEFAULT_BASE_URL
+    const val LAN_BASE_URL = "http://192.168.68.83:8123"
     const val TAILSCALE_BASE_URL = "http://100.100.139.0:8123"
 
     const val LANG_ENGLISH = "en"

@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, "/home/cromestant/code/alumbra/backend")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 from app import pipeline as p
 from app import capture as _capture
 import tempfile as _tf
@@ -1568,6 +1568,8 @@ class _R429:
 _sess_calls = []
 _real_hp = p._HTTP.post
 p._HTTP.post = lambda url, **k: (_sess_calls.append(url), _R429())[1]
+_real_lk = p._load_key
+p._load_key = lambda: "test-key"  # no real key needed (clean clone)
 _buf = _io.StringIO()
 with _ctx.redirect_stdout(_buf):
     try:
@@ -1581,6 +1583,7 @@ check("session: Meta calls go through the shared session; a 429 is "
        _json.loads(_line[0])["retry_after"] if _line else None,
        "HTTP 429" in _e429), (True, 1, "2", True))
 p._HTTP.post = _real_hp
+p._load_key = _real_lk
 check("session: one pooled session, sized above the fan-out",
       (isinstance(p._HTTP, p.requests.Session),
        p._HTTP.get_adapter("https://api.meta.ai")._pool_maxsize
@@ -1910,13 +1913,14 @@ _os.environ["TTS_ENABLED"] = "0"
 check("kill switch: no audio, tts null", p.answer_audio("x", "ANSWER", "text"),
       (None, None))
 p._HTTP.post, p.join_mp3 = _rpost, _rj
-_fa = p.FFMPEG if _os.path.exists(p.FFMPEG) else None
+_fa = p.FFMPEG if _os.path.exists(p.FFMPEG) else __import__("shutil").which("ffmpeg")
 if _fa:
-    _sp = sorted(__import__("pathlib").Path(
-        "/home/cromestant/code/alumbra/flow-test-output/voxtral").glob("*_sheila.mp3"))[:2]
+    # Real Voxtral output: the app's bundled clips.
+    _sp = sorted((__import__("pathlib").Path(__file__).resolve().parents[2]
+                  / "android/app/src/main/assets/voice").glob("*.mp3"))[:2]
     if len(_sp) == 2:
         _j = p.join_mp3([f.read_bytes() for f in _sp])
-        check("join_mp3: real spike files -> one valid MP3", p._is_mp3(_j or b""), True)
+        check("join_mp3: two real Voxtral clips -> one valid MP3", p._is_mp3(_j or b""), True)
 
 # App wiring
 from app.main import app

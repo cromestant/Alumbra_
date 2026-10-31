@@ -6,16 +6,20 @@ Meta Model API), and dispatches volunteer escalations.
 
 ## Run
 
+Needs Python 3.12 or newer (tested on 3.12 and 3.14) and ffmpeg on the PATH (`apt install ffmpeg`).
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
+cp backend/.env.example .env   # repo root; fill in the keys
+cd backend && ../.venv/bin/python -m uvicorn app.main:app --port 8123
 ```
 
+Production runs under systemd from `deploy/alumbra-api.service`: one
+worker only (escalations and follow-ups are per-process state).
+
 - `GET /health` → `{"status": "ok"}`
-- `POST /v1/clips` — multipart video upload. Saves the clip to `uploads/`
-  and returns 501 until the pipeline is wired (hackathon days 1–2).
-- `POST /v1/asks` — snap & ask. Stubbed with 501 for now.
+- `POST /ask`, `POST /followup` — the app's endpoints.
+- `GET /volunteer` — the volunteer console (needs `VOLUNTEER_TOKEN`).
 
 ## Pipeline stages
 

@@ -1,0 +1,32 @@
+# Alumbra API: systemd unit template. Replace /srv/alumbra and the
+# alumbra user with the VPS layout, then copy to
+# /etc/systemd/system/alumbra-api.service.
+#
+# --workers 1 is load-bearing. Escalation cases and the ask cache
+# (follow-ups) live in process memory, and a second worker splits them:
+# a follow-up or an escalation poll reaching the other worker gets a
+# 404, so they break silently. Scale up, not out.
+#
+# Bound to loopback only: the reverse proxy terminates TLS in front.
+
+[Unit]
+Description=Alumbra API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alumbra
+Group=alumbra
+WorkingDirectory=/srv/alumbra/backend
+# The repo-root .env (from backend/.env.example), which must set
+# ALUMBRA_PORT. It is the only route for the kill switches and
+# tunables: the app reads those from the process environment.
+EnvironmentFile=/srv/alumbra/.env
+ExecStart=/srv/alumbra/.venv/bin/python -m uvicorn app.main:app \
+    --host 127.0.0.1 --port ${ALUMBRA_PORT} --workers 1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

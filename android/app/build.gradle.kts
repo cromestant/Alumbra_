@@ -18,13 +18,20 @@ android {
         minSdk = 26
         targetSdk = 37
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "1.0.0"
+        // Submission default: the VPS. Settings still overrides it
+        // (LAN / Tailscale presets for the dev server).
+        buildConfigField("String", "DEFAULT_BASE_URL",
+            "\"https://alumbra.onthe1.app\"")
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
         }
+    }
+    buildFeatures {
+        buildConfig = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

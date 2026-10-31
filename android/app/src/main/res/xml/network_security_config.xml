@@ -1,10 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- DEV ONLY: the v1 backend runs on a LAN address over cleartext HTTP.
-     Replace with a pinned HTTPS host before any non-dev use. -->
+<!-- Cleartext HTTP only for the dev server's addresses (the Settings
+     presets, and the emulator's host alias). Everything else, including
+     the default https://alumbra.onthe1.app, is HTTPS-only. A dev server
+     on another address needs adding here, never a wider base-config. -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true">
+    <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Prefs.LAN_BASE_URL -->
+        <domain includeSubdomains="false">192.168.68.83</domain>
+        <!-- Prefs.TAILSCALE_BASE_URL -->
+        <domain includeSubdomains="false">100.100.139.0</domain>
+        <!-- Android emulator's alias for the dev machine -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
 </network-security-config>

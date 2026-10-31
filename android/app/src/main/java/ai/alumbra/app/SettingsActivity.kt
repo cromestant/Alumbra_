@@ -82,7 +82,7 @@ class SettingsActivity : AppCompatActivity() {
         val urlField: EditText = findViewById(R.id.base_url_field)
         urlField.setText(Prefs.baseUrl(this))
         findViewById<Button>(R.id.preset_lan_button).setOnClickListener {
-            urlField.setText(Prefs.DEFAULT_BASE_URL)
+            urlField.setText(Prefs.LAN_BASE_URL)
         }
         findViewById<Button>(R.id.preset_tail_button).setOnClickListener {
             urlField.setText(Prefs.TAILSCALE_BASE_URL)

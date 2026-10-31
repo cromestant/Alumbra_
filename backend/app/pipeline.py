@@ -772,7 +772,7 @@ def _load_secret(name: str) -> str:
     if key:
         return key
     repo_root = Path(__file__).resolve().parent.parent.parent
-    for path in (repo_root / ".env", Path.home() / "code" / "alumbra" / ".env"):
+    for path in (repo_root / ".env",):
         try:
             text = path.read_text()
         except OSError:

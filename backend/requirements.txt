@@ -1,3 +1,9 @@
-fastapi>=0.115
-uvicorn>=0.30
-python-multipart>=0.0.9
+# Pinned from the working dev venv, 2026-10-30; installs and passes the
+# offline checks on Python 3.12 (VPS) and 3.14 (dev). Direct
+# dependencies only; pip resolves the rest (starlette, pydantic, ...).
+# System: ffmpeg (clip frames, clip audio, answer-audio joins).
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.32  # form uploads on /ask and /followup
+requests==2.34.2
+pillow==13.0.0
