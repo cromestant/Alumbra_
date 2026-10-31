@@ -87,6 +87,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var torchOn = false
     private var manualTorch = false
     private var lastAnswer: String? = null
+    private var lastAnswerRecord: HistoryRecord? = null
 
     // Follow-up mode: re-ask on the cached ask's media (no camera).
     // Same gesture as the main screen: hold and talk, release to send;
@@ -195,7 +196,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val answer = lastAnswer
             if (answer != null) {
                 Haptics.pulse(this)
-                tts.speak(answer)
+                // The recorded voice when that answer has one.
+                val audio = HistoryStore.audioOf(this, lastAnswerRecord)
+                if (audio != null) tts.playFile(audio, listOf(answer))
+                else tts.speak(answer)
             } else {
                 statusOnly(Spoken.NO_ANSWER)
             }
@@ -509,7 +513,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             return
         }
         val capture = imageCapture ?: run {
-            announce("Camera is not ready yet.")
+            announce(Spoken.CAMERA_NOT_READY)
             return
         }
         ensurePermissions {
@@ -717,7 +721,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             sending = false
             // History keeps the technical detail; the status line
             // and voice get plain words, never the error code.
-            val plain = if (error != null) Spoken.CLIP_FAILED else "Empty clip."
+            val plain = if (error != null) Spoken.CLIP_FAILED else Spoken.EMPTY_CLIP
             HistoryStore.add(
                 this, null, null, plain, errorDetail = error
             )
@@ -735,7 +739,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (frame == null) {
                     hideWorking()
                     sending = false
-                    val msg = "Could not read the clip."
+                    val msg = Spoken.CLIP_UNREADABLE
                     HistoryStore.add(this, question, null, msg)
                     announce(msg)
                     return@runOnUiThread
@@ -1030,6 +1034,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     val record = HistoryStore.add(
                         this, shown, outcome.result, null,
                         outcome.result.questionSource,
+                        audioFile = HistoryStore.saveAudio(
+                            this, outcome.result.audio
+                        ),
                     )
                     refreshLastAnswer()
                     // The Answer screen speaks the answer itself.
@@ -1068,6 +1075,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         val full = record?.answer
         lastAnswer = full
+        lastAnswerRecord = record
         lastAnswerText.text = when {
             full == null -> getString(R.string.no_answer_yet)
             full.length > LAST_ANSWER_CHARS ->

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 uploads/
 captures/
+cache/
 
 # Android
 local.properties
@@ -16,3 +17,5 @@ build/
 .env
 eval/runs/
 assets/
+# ...but the app's bundled voice clips are shipped files.
+!android/app/src/main/assets/

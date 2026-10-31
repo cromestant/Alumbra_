@@ -69,6 +69,11 @@ object Spoken {
     const val TORCH_ON = "Flashlight on."
     const val TORCH_OFF = "Flashlight off."
     const val CAMERA_UNAVAILABLE = "Camera unavailable."
+    const val CAMERA_NOT_READY = "Camera is not ready yet."
+    const val EMPTY_CLIP = "Empty clip."
+    const val CLIP_UNREADABLE = "Could not read the clip."
+    // Keep waiting (no volunteer case): mirrors strings.xml help_waiting.
+    const val HELP_WAITING = "Still trying to reach someone…"
     const val PHOTO_FAILED = "Photo failed. Try again."
     const val CLIP_FAILED = "Clip failed. Try again."
     const val RECORDING_FAILED = "Recording failed. Try again."

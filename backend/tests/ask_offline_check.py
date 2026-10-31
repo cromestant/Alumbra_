@@ -5,6 +5,9 @@ from app import capture as _capture
 import tempfile as _tf
 # Never touch the real backend/captures: the cache sweep reads it.
 _capture.CAPTURE_DIR = __import__("pathlib").Path(_tf.mkdtemp())
+# No live TTS from the checks; the TTS block below stubs the endpoint.
+__import__("os").environ["TTS_ENABLED"] = "0"
+p.TTS_CACHE_DIR = __import__("pathlib").Path(_tf.mkdtemp())
 
 fails = []
 def check(name, got, want):
@@ -1759,6 +1762,15 @@ def _nojev(r):  # the live gate's scores jitter by 0.01 call to call
 check("kill switch: ESCALATE response identical apart from the case",
       _nojev({k: v for k, v in _esc_res.items() if k != "escalation"}),
       _nojev(_off_res))
+# TTS on vs off: the response differs only by "audio".
+_ra = p.answer_audio
+p.answer_audio = lambda ans, beh, src: ("QUFB", {"profile": "sheila"})
+with contextlib.redirect_stdout(io.StringIO()):
+    _tts_on = _comp("What is in front of me?")
+p.answer_audio = _ra
+check("TTS on: same response, plus audio only",
+      (_nojev({k: v for k, v in _tts_on.items() if k != "audio"}),
+       _tts_on.get("audio")), (_nojev(_ans_res), "QUFB"))
 p._spark_answer, p.synthesize_answer = _rsa, _rsyn
 
 # Console + app routes.
@@ -1844,6 +1856,67 @@ check("console page served when on",
       type(_call("/volunteer", "GET")).__name__, "FileResponse")
 _os.environ.pop("VOLUNTEER_TOKEN")
 esc._secret = _real_secret
+
+# Voxtral TTS (2026-10-30): script, cache, retry-or-None, envelope guard.
+import base64 as _b64
+_ID3 = b"ID3\x04" + b"\x00" * 100
+check("script: answer only", p.speech_script("Hi.", "ANSWER", "text"),
+      [("Hi.", False)])
+check("script: escalation line, preamble, answer — never the question",
+      [t for t, _ in p.speech_script("A.", "ESCALATE", "none")],
+      [p.ESCALATE_LINE, p.DIDNT_CATCH_LINE, "A."])
+check("escalation line matches the app's Spoken.kt", p.ESCALATE_LINE,
+      "I'm not sure I can help you, hold on while I try to get a hold on "
+      "someone to help us")
+check("profiles: sheila voice_id / catalog voice", (
+      p.TTS_PROFILES["sheila"], p.TTS_PROFILES["paul"][1]),
+      (("voxtral-mini-tts-3-0", "voice_id", "voice_478"), "voice"))
+_calls = []
+class _R:
+    def __init__(self, body, ok=True): self.ok, self._b, self.status_code, self.text = ok, body, 200 if ok else 500, "x"
+    def json(self): return self._b
+_rpost = p._HTTP.post
+def _fake_post(url, **kw):
+    _calls.append(kw["json"]["input"])
+    if url == p.TTS_URL:
+        return _R({"audio_data": _b64.b64encode(_ID3 + kw["json"]["input"].encode()).decode()})
+    return _rpost(url, **kw)
+p._HTTP.post = _fake_post
+_os.environ["TTS_ENABLED"] = "1"
+_rj = p.join_mp3
+p.join_mp3 = lambda parts: b"".join(parts)
+_m1, _m2 = {}, {}
+p.synthesize_speech(p.ESCALATE_LINE, cache=True, meta=_m1)
+p.synthesize_speech(p.ESCALATE_LINE, cache=True, meta=_m2)
+check("fixed line: synthesized once, then a cache hit",
+      (_m1["cache_hit"], _m2["cache_hit"], _calls.count(p.ESCALATE_LINE)),
+      (False, True, 1))
+_calls.clear()
+_a, _log = p.answer_audio("Go left.", "ESCALATE", "text")
+check("answer audio: escalation line from cache + answer, logged",
+      (_calls, _log["cache_hit"], _log["profile"], _log["chars"],
+       _b64.b64decode(_a).endswith(b"Go left.")),
+      (["Go left."], True, "sheila", len(p.ESCALATE_LINE) + 8, True))
+check("answer text is never cached", (p.TTS_CACHE_DIR / "x").parent.exists()
+      and len(list(p.TTS_CACHE_DIR.glob("*.mp3"))), 1)
+p._HTTP.post = lambda url, **kw: _R({"audio_data": _b64.b64encode(b'{"audio_data": "..."}' * 10).decode()})
+_m3 = {}
+check("JSON envelope (not MP3) is a failure, retried once, then None",
+      (p.synthesize_speech("x", meta=_m3), _m3["attempts"]), (None, 2))
+_a2, _log2 = p.answer_audio("Go left.", "ANSWER", "text")
+check("TTS failure: no audio, logged failed, the ask goes on",
+      (_a2, _log2["failed"], _log2["parts"][0]["attempts"]), (None, True, 2))
+_os.environ["TTS_ENABLED"] = "0"
+check("kill switch: no audio, tts null", p.answer_audio("x", "ANSWER", "text"),
+      (None, None))
+p._HTTP.post, p.join_mp3 = _rpost, _rj
+_fa = p.FFMPEG if _os.path.exists(p.FFMPEG) else None
+if _fa:
+    _sp = sorted(__import__("pathlib").Path(
+        "/home/cromestant/code/alumbra/flow-test-output/voxtral").glob("*_sheila.mp3"))[:2]
+    if len(_sp) == 2:
+        _j = p.join_mp3([f.read_bytes() for f in _sp])
+        check("join_mp3: real spike files -> one valid MP3", p._is_mp3(_j or b""), True)
 
 # App wiring
 from app.main import app

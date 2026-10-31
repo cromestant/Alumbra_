@@ -25,6 +25,8 @@ data class HistoryRecord(
     // behavior == VOLUNTEER: a person's answer. answer is then ALWAYS
     // the attributed line (Spoken.volunteerSays), never the bare reply.
     val volunteerName: String? = null,
+    // The answer's server audio, a file in answerAudioDir; null -> TTS.
+    val audioFile: String? = null,
 )
 
 /** Plain-JSON history in internal storage. Newest first. No new deps. */
@@ -43,6 +45,7 @@ object HistoryStore {
         questionSource: String? = null,
         errorDetail: String? = null,
         askId: String? = result?.askId,
+        audioFile: String? = null,
     ): HistoryRecord {
         val records = list(context).toMutableList()
         val sceneJson = result?.let {
@@ -72,6 +75,7 @@ object HistoryStore {
             escalationId = result?.escalation?.id,
             escalationPollS = result?.escalation?.pollS ?: 3,
             escalationWindowS = result?.escalation?.windowS ?: 120,
+            audioFile = audioFile,
         )
         records.add(0, record)
         save(context, records)
@@ -131,9 +135,38 @@ object HistoryStore {
                     .put("escalationPollS", r.escalationPollS)
                     .put("escalationWindowS", r.escalationWindowS)
                     .put("volunteerName", r.volunteerName ?: JSONObject.NULL)
+                    .put("audioFile", r.audioFile ?: JSONObject.NULL)
             )
         }
         file(context).writeText(arr.toString())
+        // Audio of records trimmed out of History goes with them.
+        val kept = trimmed.mapNotNull { it.audioFile }.toSet()
+        answerAudioDir(context).listFiles()?.forEach {
+            if (it.name !in kept) it.delete()
+        }
+    }
+
+    fun answerAudioDir(context: Context): File =
+        File(context.filesDir, "answer_audio").apply { mkdirs() }
+
+    /** The record's audio file when it is still on disk. */
+    fun audioOf(context: Context, record: HistoryRecord?): File? =
+        record?.audioFile?.let { File(answerAudioDir(context), it) }
+            ?.takeIf { it.isFile && it.length() > 0 }
+
+    /** Decode the response's base64 MP3 into a new file; null on failure. */
+    fun saveAudio(context: Context, base64: String?): String? {
+        if (base64.isNullOrEmpty()) return null
+        return try {
+            val bytes = android.util.Base64.decode(
+                base64, android.util.Base64.DEFAULT
+            )
+            val name = "answer-${System.currentTimeMillis()}.mp3"
+            File(answerAudioDir(context), name).writeBytes(bytes)
+            name
+        } catch (e: Exception) {
+            null
+        }
     }
 
     fun list(context: Context): List<HistoryRecord> {
@@ -169,6 +202,8 @@ object HistoryStore {
                     escalationWindowS = o.optInt("escalationWindowS", 120),
                     volunteerName = o.optString("volunteerName", null)
                         .takeUnless { o.isNull("volunteerName") },
+                    audioFile = o.optString("audioFile", null)
+                        .takeUnless { o.isNull("audioFile") },
                 )
             }
         } catch (e: Exception) {

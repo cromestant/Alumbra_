@@ -40,6 +40,8 @@ data class AskResult(
     val askId: String?,
     // Present only when the server opened a volunteer case (ESCALATE).
     val escalation: EscalationCase? = null,
+    // Base64 MP3 of the full spoken script, when the server voiced it.
+    val audio: String? = null,
 )
 
 /** A volunteer case to wait on: poll every pollS for up to windowS. */
@@ -375,6 +377,8 @@ class AskApi(baseUrl: String) {
                             .takeUnless { obj.isNull("question_source") },
                         askId = obj.optString("ask_id", null)
                             .takeUnless { obj.isNull("ask_id") },
+                        audio = obj.optString("audio", "")
+                            .takeIf { it.isNotEmpty() },
                         escalation = obj.optJSONObject("escalation")?.let {
                             val id = it.optString("id", "")
                             if (id.isEmpty()) null else EscalationCase(

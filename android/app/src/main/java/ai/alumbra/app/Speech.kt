@@ -2,34 +2,46 @@ package ai.alumbra.app
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.util.Log
+import java.io.File
 import java.util.Locale
 
-/** Text-to-speech honoring the Settings rate/language. Remembers the last
- * utterance so Replay works from anywhere.
+/**
+ * The app's one voice channel: an ordered queue of utterances, each a
+ * bundled clip (fixed state lines, rendered in the product voice), the
+ * answer's server audio, or phone TTS. One plays at a time, in order —
+ * a clip never overlaps answer audio or TTS. speak() flushes, then
+ * plays; speakQueued() appends.
  *
- * Init-safe: TextToSpeech binds asynchronously, and an utterance issued
- * before onInit completes is silently discarded by the platform. Requests
- * made while the engine is not ready are buffered — preserving order and
- * the flush/queue semantics of speak/speakQueued — and delivered when
- * init succeeds. If init fails, [onVoiceUnavailable] fires once so the
- * activity can say so through the state channel instead of going silent.
+ * Text is matched against the bundled clip manifest (assets/voice): an
+ * exact fixed line plays its clip, anything else is phone TTS. A
+ * missing or corrupt clip or answer file falls back to TTS of the same
+ * words — degraded voice, never silence. Settings rate applies to both.
+ *
+ * Init-safe: TTS binds asynchronously; TTS items wait at the head of the
+ * queue until it is ready (clips do not wait). If init fails,
+ * [onVoiceUnavailable] fires once and TTS items are dropped — clips
+ * still play.
  */
 class AlumbraTts(context: Context) {
     private var tts: TextToSpeech? = null
-    private var lastUtterance: String? = null
     private val appContext = context.applicationContext
+    private val main = Handler(Looper.getMainLooper())
 
     /**
      * Audio discipline: the mic and the app voice never run together —
-     * a clip's audio is transcribed evidence, so app TTS in a recording
+     * a clip's audio is transcribed evidence, so app voice in a recording
      * poisons the ask itself. While hot, speak requests are dropped
      * (deferring would speak stale lines after the window closes).
-     * The drop happens before buffering: a hot mic never queues.
      */
     @Volatile
     var micHot: Boolean = false
@@ -37,33 +49,42 @@ class AlumbraTts(context: Context) {
     /** Fired once, on no particular thread, if the engine fails to init. */
     var onVoiceUnavailable: (() -> Unit)? = null
 
-    private val lock = Any()
+    /** A clip (asset or file) with the words to speak if it won't play. */
+    private sealed interface Item
+    private data class Say(val text: String) : Item
+    private data class Clip(
+        val asset: String?,
+        val file: File?,
+        val fallback: List<String>,
+    ) : Item
+
+    // Main-thread state only.
+    private val queue = ArrayDeque<Item>()
+    private var current: Item? = null
+    private var currentTtsId: String? = null
+    private var player: MediaPlayer? = null
+    private var last: Item? = null
     private var ready = false
+    private var dead = false
     private var shut = false
     private var unavailableFired = false
-    private var pendingFlush: String? = null
-    private val pendingQueue = mutableListOf<String>()
     private var utteranceSeq = 0
 
     init {
         tts = TextToSpeech(appContext) { status ->
-            var failed = false
-            synchronized(lock) {
-                if (shut) return@TextToSpeech
+            onMain {
+                if (shut) return@onMain
                 if (status == TextToSpeech.SUCCESS) {
                     ready = true
                     applySettings()
                     watchUtterances()
-                    deliverPendingLocked()
+                    Log.i(TTS_TAG, "engine ready")
                 } else {
-                    failed = true
+                    dead = true
+                    Log.w(TTS_TAG, "engine init FAILED")
+                    fireUnavailable()
                 }
-            }
-            if (failed) {
-                android.util.Log.w(TTS_TAG, "engine init FAILED")
-                fireUnavailable()
-            } else {
-                android.util.Log.i(TTS_TAG, "engine ready")
+                pump()
             }
         }
     }
@@ -86,136 +107,229 @@ class AlumbraTts(context: Context) {
         engine.setSpeechRate(Prefs.speechRate(appContext))
     }
 
-    fun speak(text: String) {
-        if (micHot) {
-            android.util.Log.i(TTS_TAG, "dropped-hot: $text")
-            return
-        }
-        lastUtterance = text
-        synchronized(lock) {
-            if (shut) return
-            if (!ready) {
-                // Flush semantics pre-ready: replace the whole buffer.
-                pendingFlush = text
-                pendingQueue.clear()
-                android.util.Log.i(TTS_TAG, "buffered-flush: $text")
-                return
-            }
-            applySettings()
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, nextIdLocked())
-            android.util.Log.i(TTS_TAG, "speak: $text")
-        }
-    }
+    fun speak(text: String) = enqueue(itemFor(text), flush = true)
 
     /** Queue after the current utterance (escalation line, then answer). */
-    fun speakQueued(text: String) {
-        if (micHot) {
-            android.util.Log.i(TTS_TAG, "dropped-hot: $text")
-            return
-        }
-        synchronized(lock) {
-            if (shut) return
-            if (!ready) {
-                pendingQueue.add(text)
-                android.util.Log.i(TTS_TAG, "buffered-queue: $text")
-                return
-            }
-            applySettings()
-            tts?.speak(text, TextToSpeech.QUEUE_ADD, null, nextIdLocked())
-            android.util.Log.i(TTS_TAG, "queued: $text")
-        }
-    }
+    fun speakQueued(text: String) = enqueue(itemFor(text), flush = false)
+
+    /**
+     * The answer's server audio (the full spoken script). fallback is
+     * that same script as text, spoken by TTS if the file won't play.
+     */
+    fun playFile(file: File, fallback: List<String>) =
+        enqueue(Clip(null, file, fallback), flush = true)
 
     fun replay() {
-        lastUtterance?.let { speak(it) }
+        last?.let { enqueue(it, flush = true) }
     }
 
-    fun stop() {
-        synchronized(lock) {
-            pendingFlush = null
-            pendingQueue.clear()
-        }
-        tts?.stop()
-    }
+    fun stop() = onMain { flushLocked() }
 
-    fun shutdown() {
-        synchronized(lock) {
-            shut = true
-            ready = false
-            pendingFlush = null
-            pendingQueue.clear()
-        }
-        tts?.stop()
+    fun shutdown() = onMain {
+        shut = true
+        flushLocked()
         tts?.shutdown()
         tts = null
     }
 
-    /** Caller must hold [lock]; engine known ready. */
-    private fun deliverPendingLocked() {
+    private fun itemFor(text: String): Item =
+        VoiceClips.assetFor(appContext, text)?.let {
+            Clip(it, null, listOf(text))
+        } ?: Say(text)
+
+    private fun enqueue(item: Item, flush: Boolean) {
         if (micHot) {
-            // Init finished mid-capture: evidence rule wins, drop all.
-            android.util.Log.i(TTS_TAG, "dropped-hot ${pendingCountLocked()} buffered")
-            pendingFlush = null
-            pendingQueue.clear()
+            Log.i(TTS_TAG, "dropped-hot: ${describe(item)}")
             return
         }
-        pendingFlush?.let {
-            tts?.speak(it, TextToSpeech.QUEUE_FLUSH, null, nextIdLocked())
-            android.util.Log.i(TTS_TAG, "delivered-flush: $it")
+        onMain {
+            if (shut) return@onMain
+            if (flush) {
+                flushLocked()
+                last = item
+            }
+            queue.addLast(item)
+            Log.i(TTS_TAG, (if (flush) "speak: " else "queued: ") + describe(item))
+            pump()
         }
-        for (queued in pendingQueue) {
-            tts?.speak(queued, TextToSpeech.QUEUE_ADD, null, nextIdLocked())
-            android.util.Log.i(TTS_TAG, "delivered-queue: $queued")
-        }
-        pendingFlush = null
-        pendingQueue.clear()
     }
 
-    private fun pendingCountLocked(): Int =
-        pendingQueue.size + if (pendingFlush == null) 0 else 1
+    private fun flushLocked() {
+        queue.clear()
+        current = null
+        currentTtsId = null
+        player?.let {
+            try {
+                it.stop()
+            } catch (e: Exception) {
+            }
+            it.release()
+        }
+        player = null
+        tts?.stop()
+    }
 
-    private fun nextIdLocked(): String {
-        utteranceSeq += 1
-        return "alumbra-$utteranceSeq"
+    /** Start the head of the queue if nothing is playing. */
+    private fun pump() {
+        if (current != null || shut) return
+        val item = queue.removeFirstOrNull() ?: return
+        when (item) {
+            is Say -> {
+                if (dead) {
+                    Log.i(TTS_TAG, "dropped-dead: ${item.text}")
+                    pump()
+                    return
+                }
+                if (!ready) {
+                    queue.addFirst(item)  // waits for init
+                    return
+                }
+                current = item
+                applySettings()
+                val id = "alumbra-${++utteranceSeq}"
+                currentTtsId = id
+                tts?.speak(item.text, TextToSpeech.QUEUE_ADD, null, id)
+            }
+            is Clip -> {
+                current = item
+                if (!startClip(item)) fallBack(item)
+            }
+        }
+    }
+
+    private fun startClip(item: Clip): Boolean {
+        val mp = MediaPlayer()
+        return try {
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            if (item.asset != null) {
+                appContext.assets.openFd(item.asset).use {
+                    mp.setDataSource(it.fileDescriptor, it.startOffset, it.length)
+                }
+            } else {
+                mp.setDataSource(item.file!!.absolutePath)
+            }
+            mp.setOnCompletionListener { done(item, mp) }
+            mp.setOnErrorListener { _, what, extra ->
+                Log.w(TTS_TAG, "clip error $what/$extra: ${describe(item)}")
+                if (current === item) {
+                    release(mp)
+                    fallBack(item)
+                }
+                true
+            }
+            mp.prepare()
+            val rate = Prefs.speechRate(appContext)
+            if (rate != 1.0f) {
+                mp.playbackParams = mp.playbackParams.setSpeed(rate)
+            }
+            mp.start()
+            player = mp
+            true
+        } catch (e: Exception) {
+            Log.w(TTS_TAG, "clip failed (${e.javaClass.simpleName}): " +
+                describe(item))
+            mp.release()
+            false
+        }
+    }
+
+    /** The clip won't play: its words, by TTS, in its place. */
+    private fun fallBack(item: Clip) {
+        current = null
+        Log.i(TTS_TAG, "fallback-tts: ${describe(item)}")
+        for (text in item.fallback.asReversed()) queue.addFirst(Say(text))
+        pump()
+    }
+
+    private fun done(item: Item, mp: MediaPlayer?) {
+        if (current !== item) return
+        if (mp != null) release(mp)
+        current = null
+        currentTtsId = null
+        pump()
+    }
+
+    private fun release(mp: MediaPlayer) {
+        if (player === mp) player = null
+        mp.release()
+    }
+
+    private fun describe(item: Item): String = when (item) {
+        is Say -> item.text
+        is Clip -> (item.asset ?: item.file?.name ?: "?") +
+            " (${item.fallback.joinToString(" ").take(60)})"
+    }
+
+    private fun onMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block()
+        else main.post(block)
     }
 
     private fun fireUnavailable() {
-        val fire = synchronized(lock) {
-            if (unavailableFired) false else {
-                unavailableFired = true
-                true
-            }
-        }
-        if (fire) {
-            try {
-                onVoiceUnavailable?.invoke()
-            } catch (e: Exception) {
-            }
+        if (unavailableFired) return
+        unavailableFired = true
+        try {
+            onVoiceUnavailable?.invoke()
+        } catch (e: Exception) {
         }
     }
 
-    /** Engine-confirmed speech events; also the no-silent-drop evidence. */
+    /** Engine-confirmed speech events advance the queue. */
     private fun watchUtterances() {
         tts?.setOnUtteranceProgressListener(
             object : android.speech.tts.UtteranceProgressListener() {
                 override fun onStart(id: String) {
-                    android.util.Log.i(TTS_TAG, "started $id")
+                    Log.i(TTS_TAG, "started $id")
                 }
 
                 override fun onDone(id: String) {
-                    android.util.Log.i(TTS_TAG, "done $id")
+                    Log.i(TTS_TAG, "done $id")
+                    advance(id)
                 }
 
                 @Deprecated("deprecated in API")
                 override fun onError(id: String) {
-                    android.util.Log.w(TTS_TAG, "error $id")
+                    Log.w(TTS_TAG, "error $id")
+                    advance(id)
                 }
             }
         )
     }
 
+    private fun advance(id: String) = onMain {
+        val item = current
+        if (item is Say && currentTtsId == id) done(item, null)
+    }
+
     companion object {
         const val TTS_TAG = "AlumbraTts"
+    }
+}
+
+/** Bundled fixed-line clips: assets/voice/manifest.json, text -> id. */
+object VoiceClips {
+    @Volatile
+    private var byText: Map<String, String>? = null
+
+    fun assetFor(context: Context, text: String): String? {
+        val map = byText ?: load(context).also { byText = it }
+        return map[text]?.let { "voice/$it.mp3" }
+    }
+
+    private fun load(context: Context): Map<String, String> = try {
+        val lines = org.json.JSONObject(
+            context.assets.open("voice/manifest.json").bufferedReader()
+                .use { it.readText() }
+        ).getJSONObject("lines")
+        lines.keys().asSequence().associateBy { lines.getString(it) }
+    } catch (e: Exception) {
+        Log.w(AlumbraTts.TTS_TAG, "no voice manifest: ${e.message}")
+        emptyMap()
     }
 }
 

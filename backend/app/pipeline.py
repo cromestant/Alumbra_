@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import copy
+import hashlib
 import io
 import json
 import math
@@ -3449,6 +3450,189 @@ def synthesize_answer(
     return out, True, int((time.time() - t0) * 1000)
 
 
+# ----------------------------------------------------------------------------
+# Spoken audio — Voxtral TTS (Mistral), the product's voice
+# ----------------------------------------------------------------------------
+
+TTS_URL = "https://api.mistral.ai/v1/audio/speech"
+TTS_TIMEOUT_S = 20
+TTS_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "tts"
+# A profile is (model, request field, voice). The two recipes do not
+# mix: a catalog voice under voice_id (or the reverse) is a 400 / 3051
+# "voice is not supported for speech v1".
+TTS_PROFILES = {
+    "sheila": ("voxtral-mini-tts-3-0", "voice_id", "voice_478"),
+    "paul": ("voxtral-mini-tts-2603", "voice", "en_paul_neutral"),
+    "jane": ("voxtral-mini-tts-2603", "voice", "gb_jane_neutral"),
+}
+TTS_PROFILE_DEFAULT = "sheila"
+# The app's spoken lines that ride on the answer audio (Spoken.kt has
+# the same strings: the no-audio fallback speaks them there).
+ESCALATE_LINE = ("I'm not sure I can help you, hold on while I try to get "
+                 "a hold on someone to help us")
+DIDNT_CATCH_LINE = "I didn't catch a question, so I described the scene."
+
+
+def tts_enabled() -> bool:
+    """Kill switch mirrors audio_enabled(): TTS_ENABLED=0 off."""
+    return os.environ.get("TTS_ENABLED", "").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def tts_profile() -> str:
+    name = _load_secret("TTS_VOICE_PROFILE").strip().lower()
+    return name if name in TTS_PROFILES else TTS_PROFILE_DEFAULT
+
+
+def _is_mp3(data: bytes) -> bool:
+    """Real MPEG audio: an ID3 tag or a frame sync up front. The speech
+    endpoint wraps its audio in JSON; this is what keeps that envelope
+    from ever shipping as an .mp3."""
+    return len(data) > 64 and (data[:3] == b"ID3" or (
+        data[0] == 0xFF and data[1] & 0xE0 == 0xE0))
+
+
+def _tts_call(text: str, profile: str) -> bytes:
+    model, field, voice = TTS_PROFILES[profile]
+    r = _HTTP.post(
+        TTS_URL,
+        headers={"Authorization": f"Bearer {_load_secret('MISTRAL_API_KEY')}",
+                 "Content-Type": "application/json"},
+        json={"model": model, "input": text, field: voice,
+              "response_format": "mp3"},
+        timeout=TTS_TIMEOUT_S)
+    if not r.ok:
+        raise PipelineError(f"tts HTTP {r.status_code}: {r.text[:200]}")
+    # The response is JSON {"audio_data": "<base64 mp3>"}, not audio.
+    data = base64.b64decode(r.json()["audio_data"])
+    if not _is_mp3(data):
+        raise PipelineError(f"tts returned {len(data)} bytes, not MP3")
+    return data
+
+
+def synthesize_speech(text: str, cache: bool = False,
+                      profile: str | None = None,
+                      meta: dict[str, Any] | None = None) -> bytes | None:
+    """MP3 of text in the configured voice, or None after one bounded
+    retry (logged). cache=True for fixed lines: keyed by (profile, text)
+    under backend/cache/tts/, so each synthesizes once, ever. meta, when
+    given, receives {ms, cache_hit, attempts, error}."""
+    profile = profile or tts_profile()
+    meta = meta if meta is not None else {}
+    t0 = time.time()
+    path = None
+    if cache:
+        key = hashlib.sha256(f"{profile}\n{text}".encode()).hexdigest()[:32]
+        path = TTS_CACHE_DIR / f"{key}.mp3"
+        try:
+            data = path.read_bytes()
+            if _is_mp3(data):
+                meta.update(ms=int((time.time() - t0) * 1000),
+                            cache_hit=True, attempts=0)
+                return data
+        except OSError:
+            pass
+    meta["cache_hit"] = False
+    for attempt in (1, 2):
+        try:
+            data = _tts_call(text, profile)
+        except Exception as e:  # noqa: BLE001 — retry once, then None
+            meta.update(attempts=attempt, error=f"{type(e).__name__}: {e}"[:200])
+            continue
+        meta.update(attempts=attempt, ms=int((time.time() - t0) * 1000))
+        meta.pop("error", None)
+        if path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
+            except OSError as e:
+                print(json.dumps({"tts_cache_error": repr(e)}), flush=True)
+        return data
+    meta["ms"] = int((time.time() - t0) * 1000)
+    return None
+
+
+def join_mp3(parts: list[bytes]) -> bytes | None:
+    """One MP3 from several (stream copy: no re-encode, fresh header so
+    the duration is right). Same voice, same format, so this is safe."""
+    if len(parts) == 1:
+        return parts[0]
+    ffmpeg = FFMPEG if os.path.exists(FFMPEG) else shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    with tempfile.TemporaryDirectory() as d:
+        names = []
+        for i, data in enumerate(parts):
+            f = Path(d) / f"{i}.mp3"
+            f.write_bytes(data)
+            names.append(f"file '{f}'")
+        (Path(d) / "list.txt").write_text("\n".join(names) + "\n")
+        out = Path(d) / "out.mp3"
+        r = subprocess.run(
+            [ffmpeg, "-v", "error", "-y", "-f", "concat", "-safe", "0",
+             "-i", str(Path(d) / "list.txt"), "-c", "copy", "-f", "mp3",
+             str(out)], capture_output=True, timeout=30)
+        if r.returncode != 0 or not out.exists():
+            return None
+        data = out.read_bytes()
+    return data if _is_mp3(data) else None
+
+
+def speech_script(answer: str, behavior: str,
+                  question_source: str) -> list[tuple[str, bool]]:
+    """The answer's spoken script as (text, fixed) parts, in the order
+    the app speaks it (AnswerActivity): escalation line, the no-question
+    preamble, then the answer verbatim. Never the question itself."""
+    parts: list[tuple[str, bool]] = []
+    if behavior == "ESCALATE":
+        parts.append((ESCALATE_LINE, True))
+    if question_source == "none":
+        parts.append((DIDNT_CATCH_LINE, True))
+    if answer.strip():
+        parts.append((answer, False))
+    return parts
+
+
+def answer_audio(answer: str, behavior: str, question_source: str
+                 ) -> tuple[str | None, dict[str, Any] | None]:
+    """(base64 MP3 of the full spoken script, tts log field). Any part
+    failing drops the whole audio: the app then speaks the same script
+    with its own TTS, so the words never change, only the voice. Never
+    raises: a TTS failure never fails the ask."""
+    if not tts_enabled():
+        return None, None
+    profile = tts_profile()
+    script = speech_script(answer, behavior, question_source)
+    if not script:
+        return None, None
+    t0 = time.time()
+    log: dict[str, Any] = {"profile": profile,
+                           "chars": sum(len(t) for t, _ in script),
+                           "cache_hit": False, "parts": []}
+    metas = [{} for _ in script]
+    try:
+        # Fixed lines (usually cached) and the answer run side by side.
+        with concurrent.futures.ThreadPoolExecutor(len(script)) as pool:
+            futs = [pool.submit(synthesize_speech, t, fixed, profile, m)
+                    for (t, fixed), m in zip(script, metas)]
+            parts = [f.result() for f in futs]
+        joined = (join_mp3(parts)  # type: ignore[arg-type]
+                  if all(p is not None for p in parts) else None)
+    except Exception as e:  # noqa: BLE001
+        joined = None
+        log["error"] = f"{type(e).__name__}: {e}"[:200]
+    log["parts"] = [{"chars": len(t), "fixed": fixed, **m}
+                    for (t, fixed), m in zip(script, metas)]
+    log["cache_hit"] = any(m.get("cache_hit") for m in metas)
+    log["ms"] = int((time.time() - t0) * 1000)
+    if joined is None:
+        log["failed"] = True
+        return None, log
+    return base64.b64encode(joined).decode("ascii"), log
+
+
 def run_ask(
     image: bytes,
     question: str,
@@ -3871,6 +4055,11 @@ def _compose(
             if behavior == "ESCALATE" else None)
     if case is not None:
         result["escalation"] = case
+    # The spoken script in the product voice; absent (kill switch, TTS
+    # failure after its retry) the app speaks the same words itself.
+    audio_b64, tts_log = answer_audio(answer, behavior, question_source)
+    if audio_b64 is not None:
+        result["audio"] = audio_b64
     # Part C — one log line per ask (question text is the user's own
     # words to their own server; keys never appear here).
     # Instances per name ("tortoiseshell cat x2"): a deduplicated list
@@ -3902,6 +4091,7 @@ def _compose(
         "floor_found": floor_found,
         "ask_id": ask_id,
         "followup": followup,
+        "tts": tts_log,
         **({"escalation": {"id": case["id"], "outcome": "pending",
                            "wait_ms": None}} if case is not None else {}),
         # Only with capture metadata: old-app log lines stay as they were.

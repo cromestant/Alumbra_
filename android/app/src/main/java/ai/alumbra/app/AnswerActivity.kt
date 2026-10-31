@@ -42,6 +42,8 @@ class AnswerActivity : AppCompatActivity() {
     private var escalated: Boolean = false
     private var errored: Boolean = false
     private var preamble: String? = null
+    // The answer's server audio (full script), when it has one.
+    private var audio: java.io.File? = null
 
     // Volunteer wait: caseId != null while waiting.
     private val handler = Handler(Looper.getMainLooper())
@@ -74,6 +76,7 @@ class AnswerActivity : AppCompatActivity() {
         val record = HistoryStore.get(
             this, intent.getLongExtra(EXTRA_RECORD_ID, -1)
         )
+        audio = HistoryStore.audioOf(this, record)
         if (record == null || (record.answer == null && record.error == null)) {
             answerView.text = getString(R.string.answer_missing)
             answer = getString(R.string.answer_missing)
@@ -185,7 +188,7 @@ class AnswerActivity : AppCompatActivity() {
         findViewById<Button>(R.id.keep_waiting_button).setOnClickListener {
             // v1: no volunteer channel yet — confirm we're still here.
             Haptics.pulse(this)
-            tts.speak(getString(R.string.help_waiting))
+            tts.speak(Spoken.HELP_WAITING)
         }
         findViewById<Button>(R.id.leave_button).setOnClickListener {
             goToAsk()
@@ -334,17 +337,20 @@ class AnswerActivity : AppCompatActivity() {
             tts.speak(answer)
             return
         }
-        val lead = preamble
-        if (escalated) {
-            tts.speak(Spoken.ESCALATE_LINE)
-            if (lead != null) tts.speakQueued(lead)
-            if (answer.isNotBlank()) tts.speakQueued(answer)
-        } else if (lead != null) {
-            tts.speak(lead)
-            if (answer.isNotBlank()) tts.speakQueued(answer)
-        } else {
-            tts.speak(answer)
+        // The spoken script: escalation line, preamble, answer. The
+        // server's audio is this same script in the product voice.
+        val script = listOfNotNull(
+            Spoken.ESCALATE_LINE.takeIf { escalated },
+            preamble,
+            answer.takeIf { it.isNotBlank() || (!escalated && preamble == null) },
+        )
+        val file = audio
+        if (file != null) {
+            tts.playFile(file, script)
+            return
         }
+        script.firstOrNull()?.let { tts.speak(it) }
+        script.drop(1).forEach { tts.speakQueued(it) }
     }
 
     companion object {
