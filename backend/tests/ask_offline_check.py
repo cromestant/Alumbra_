@@ -1237,7 +1237,7 @@ del _os.environ["JEV_GATE_ENABLED"], _os.environ["FLOOR_LOOK_ENABLED"]
 import asyncio as _asyncio, tempfile as _tempfile, json as _json
 from pathlib import Path as _Path
 from starlette.datastructures import UploadFile as _Upload
-from app import capture as _cap, main as _main
+from app import capture as _cap, main as _main, tokens as _tok
 _tmp = _Path(_tempfile.mkdtemp())
 _cap.CAPTURE_DIR = _tmp
 _os.environ["CAPTURE_ENABLED"] = "1"
@@ -1248,9 +1248,11 @@ def _call(path, **kw):
     except Exception as e:
         return None, e
 _real_ask, _real_fu = _main.run_ask, _main.run_followup
-# APP_TOKEN off for these checks whatever the local .env says.
-_real_ls = _main._load_secret
-_main._load_secret = lambda n: "" if n == "APP_TOKEN" else _real_ls(n)
+# APP_TOKEN off for these checks whatever the local .env says; the
+# token store in a temp DATA_DIR, never the real one.
+_real_ls = _tok._load_secret
+_tok._load_secret = lambda n: "" if n == "APP_TOKEN" else _real_ls(n)
+_os.environ["DATA_DIR"] = _tempfile.mkdtemp()
 _main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
     trace.update({"ask_id": "abc", "scene_full": [{"name": "cat"}] * 2}),
     {"answer": "I can see two cats in this photo.", "ask_id": "abc"})[1]
@@ -1286,7 +1288,7 @@ _code = lambda r: getattr(r[1], "status_code", 200 if r[0] else None)
 _stalled = _main.run_ask
 _main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
     trace.update({"ask_id": "abc"}), {"answer": "Two cats.", "ask_id": "abc"})[1]
-_main._load_secret = lambda n: "s3cret" if n == "APP_TOKEN" else _real_ls(n)
+_tok._load_secret = lambda n: "s3cret" if n == "APP_TOKEN" else _real_ls(n)
 _n0 = len(list(_tmp.glob("*/*")))
 check("app token set: missing, wrong, right on /ask",
       [_code(_tok_ask(t)) for t in (None, "", "nope", "s3cret")],
@@ -1295,9 +1297,93 @@ check("app token set: missing, wrong, right on /followup",
       [_code(_tok_fu(t)) for t in (None, "nope", "s3cret")], [401, 401, 200])
 check("app token: a rejected ask leaves no capture",
       len(list(_tmp.glob("*/*"))) - _n0, 2)  # the two accepted calls only
-_main._load_secret = lambda n: "" if n == "APP_TOKEN" else _real_ls(n)
+# Self-registration (tokens.py): minted tokens, limits, revocation.
+_reg = lambda iid: _call("/v1/register", body={"install_id": iid})
+_detail = lambda r: getattr(r[1], "detail", {}) or {}
+_r1 = _reg("install-aaaa")
+check("register: a new install gets t_001", (_r1[0] or {}).get("id"), "t_001")
+check("register: its token passes /ask and /followup",
+      (_code(_tok_ask(_r1[0]["token"])), _code(_tok_fu(_r1[0]["token"]))),
+      (200, 200))
+_r1b = _reg("install-aaaa")
+check("register again: same install keeps its slot, new token only",
+      (_r1b[0]["id"], _code(_tok_ask(_r1[0]["token"])),
+       _code(_tok_ask(_r1b[0]["token"]))), ("t_001", 401, 200))
+check("register: a malformed install id is a 400",
+      (_code(_reg("x")), _code(_reg("bad id with spaces!"))), (400, 400))
+_tok.set_limit("mint_cap", "2")
+_r2 = _reg("install-bbbb")
+_r3 = _reg("install-cccc")
+check("mint cap 2: the second install mints, the third is refused",
+      (_r2[0]["id"], _code(_r3), _detail(_r3).get("error")),
+      ("t_002", 403, "registration_closed"))
+_tok.set_limit("mint_cap", "100")
+_tok.set_limit("mint_rate", "2/3600")
+_r3 = _reg("install-cccc")
+check("mint rate 2/h: the third mint inside the hour waits",
+      (_code(_r3), _detail(_r3).get("error"),
+       0 < int(_r3[1].headers["Retry-After"]) <= 3601),
+      (429, "mint_rate", True))
+_tok.set_limit("mint_rate", "20/3600")
+_tok._asks.clear(); _tok._all_asks.clear()
+_tok.set_limit("ask_rate", "3/300")
+_t2 = _r2[0]["token"]
+_seq = [_tok_ask(_t2), _tok_fu(_t2), _tok_ask(_t2), _tok_fu(_t2)]
+check("ask rate 3/5min: asks and follow-ups both count, the 4th waits",
+      ([_code(r) for r in _seq], _detail(_seq[-1]).get("error"),
+       0 < int(_seq[-1][1].headers["Retry-After"]) <= 301),
+      ([200, 200, 200, 429], "ask_rate", True))
+check("ask rate is per token: another token still asks",
+      _code(_tok_ask(_r1b[0]["token"])), 200)
+_tok._asks.clear(); _tok._all_asks.clear()
+_tok.set_limit("ask_rate", "10/300")
+_tok.set_limit("ask_cap", "2/3600")
+_cap_seq = [_tok_ask(_t2), _tok_ask(_r1b[0]["token"]), _tok_ask(_t2)]
+check("ask cap 2/h across tokens: the 3rd ask is refused",
+      ([_code(r) for r in _cap_seq], _detail(_cap_seq[-1]).get("error")),
+      ([200, 200, 429], "ask_cap"))
+check("the owner token is not limited",
+      [_code(_tok_ask("s3cret")) for _ in range(3)], [200, 200, 200])
+_tok.set_limit("ask_cap", "300/3600")
+_tok._asks.clear(); _tok._all_asks.clear()
+_n1 = len(list(_tmp.glob("*/*")))
+_tok.set_limit("ask_rate", "0/300")
+_tok_ask(_t2)
+check("a rate-limited ask leaves no capture",
+      len(list(_tmp.glob("*/*"))) - _n1, 0)
+_tok.set_limit("ask_rate", "10/300")
+check("revoke t_002: its token is refused, its install is banned",
+      (_tok.revoke("t_002"), _code(_tok_ask(_t2)),
+       _detail(_reg("install-bbbb")).get("error")),
+      ("install-bbbb", 401, "install_banned"))
+_rb = _reg("install-bbbb") if _tok.unban("t_002") else (None, None)
+check("unban t_002: the install registers again in its old slot",
+      ((_rb[0] or {}).get("id"), _code(_tok_ask((_rb[0] or {}).get("token")))),
+      ("t_002", 200))
+_os.environ["REGISTRATION_ENABLED"] = "0"
+check("REGISTRATION_ENABLED=0: register 404s, minted tokens still work",
+      (_code(_reg("install-dddd")), _code(_tok_ask(_r1b[0]["token"]))),
+      (404, 200))
+_os.environ.pop("REGISTRATION_ENABLED")
+check("revoke --all: every token refused, every install banned",
+      (_tok.revoke_all(), _code(_tok_ask(_r1b[0]["token"])),
+       _detail(_reg("install-aaaa")).get("error")),
+      (2, 401, "install_banned"))
+def _bad_limit(k, v):
+    try:
+        _tok.set_limit(k, v)
+        return None
+    except (KeyError, ValueError) as e:
+        return type(e).__name__
+check("set_limit refuses unknown keys and bad values",
+      [_bad_limit(k, v) for k, v in (("nope", "1"), ("ask_rate", "ten"),
+                                     ("mint_cap", "-1"), ("ask_cap", "5/0"))],
+      ["KeyError", "ValueError", "ValueError", "ValueError"])
+_tok._load_secret = lambda n: "" if n == "APP_TOKEN" else _real_ls(n)
 check("app token unset: no header needed",
       (_code(_tok_ask(None)), _code(_tok_fu(None))), (200, 200))
+check("app token unset: register 404s (the app asks without a token)",
+      _code(_reg("install-eeee")), 404)
 _main.run_ask = _stalled
 _f = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "request.json").read_text())
 check("capture: follow-up names its parent ask",

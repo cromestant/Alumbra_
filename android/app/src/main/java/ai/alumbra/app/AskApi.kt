@@ -1,5 +1,6 @@
 package ai.alumbra.app
 
+import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import java.io.File
@@ -77,10 +78,18 @@ sealed interface AskOutcome {
  * (optional capture geometry, both or neither). POST
  * {base_url}/followup re-runs the pipeline on a cached ask's media with
  * a new question (no image). Unknown response fields are ignored.
+ *
+ * Both send the saved app token as X-App-Token. With none saved, the
+ * app first registers itself (POST {base_url}/v1/register with its
+ * install id) and saves the token it gets; a 404 there means the server
+ * has no gate, and the ask goes without one. A 401 clears the token and
+ * registers once more before giving up (revoked, or a reset server).
  */
-class AskApi(baseUrl: String, private val appToken: String = "") {
+class AskApi(baseUrl: String, context: Context) {
+    private val appContext = context.applicationContext
     private val url = baseUrl.trimEnd('/') + "/ask"
     private val followupUrl = baseUrl.trimEnd('/') + "/followup"
+    private val registerUrl = baseUrl.trimEnd('/') + "/v1/register"
     private val escalationsUrl = baseUrl.trimEnd('/') + "/v1/escalations"
 
     // Eval asks took 8-67s end to end; the Working state is built for it.
@@ -174,6 +183,84 @@ class AskApi(baseUrl: String, private val appToken: String = "") {
         mapGone: Boolean,
         callback: (AskOutcome) -> Unit,
     ) {
+        val saved = Prefs.appToken(appContext)
+        if (saved.isNotEmpty()) {
+            send(targetUrl, form, desc, mapGone, saved, true, callback)
+        } else {
+            register(callback) { token ->
+                send(targetUrl, form, desc, mapGone, token, false, callback)
+            }
+        }
+    }
+
+    /**
+     * POST /v1/register for this install's token; then(token) on success
+     * ("" when the server has no gate), callback(Err) when refused.
+     */
+    private fun register(callback: (AskOutcome) -> Unit, then: (String) -> Unit) {
+        val body = JSONObject().put("install_id", Prefs.installId(appContext))
+            .toString().toRequestBody("application/json".toMediaType())
+        val newCall = pollClient.newCall(
+            Request.Builder().url(registerUrl).post(body).build()
+        )
+        call = newCall
+        Log.i(NET_TAG, "POST $registerUrl")
+        newCall.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.i(NET_TAG, "register failed: ${e.javaClass.name}: ${e.message}")
+                callback(
+                    if (call.isCanceled()) AskOutcome.Err("Cancelled.")
+                    else AskOutcome.Err(
+                        Spoken.SERVER_UNREACHABLE,
+                        "${e.javaClass.name}: ${e.message}",
+                    )
+                )
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val token = response.use {
+                    Log.i(NET_TAG, "register HTTP ${it.code}")
+                    when (it.code) {
+                        200 -> try {
+                            JSONObject(it.body?.string().orEmpty())
+                                .getString("token")
+                        } catch (e: Exception) {
+                            null
+                        }
+                        404 -> ""
+                        else -> {
+                            callback(registerRefused(it.code))
+                            return
+                        }
+                    }
+                }
+                if (token == null) {
+                    callback(AskOutcome.Err(Spoken.BAD_RESPONSE, "register body"))
+                    return
+                }
+                Prefs.setAppToken(appContext, token)
+                then(token)
+            }
+        })
+    }
+
+    private fun registerRefused(code: Int): AskOutcome.Err = when (code) {
+        // Registration full, or this install revoked: the same words.
+        403 -> AskOutcome.Err(Spoken.DEMO_FULL, "register HTTP 403", plain = true)
+        429 -> AskOutcome.Err(Spoken.RATE_LIMITED, "register HTTP 429", plain = true)
+        else -> AskOutcome.Err(Spoken.SERVER_ERROR, "register HTTP $code")
+    }
+
+    /** One POST of the form; canReRegister: a 401 may mint a new token. */
+    private fun send(
+        targetUrl: String,
+        form: MultipartBody,
+        desc: String,
+        mapGone: Boolean,
+        appToken: String,
+        canReRegister: Boolean,
+        callback: (AskOutcome) -> Unit,
+    ) {
         val request = Request.Builder().url(targetUrl).post(form).apply {
             if (appToken.isNotEmpty()) header("X-App-Token", appToken)
         }.build()
@@ -217,6 +304,24 @@ class AskApi(baseUrl: String, private val appToken: String = "") {
                                     Spoken.ASK_EXPIRED,
                                     "HTTP 410",
                                     expired = true,
+                                )
+                            )
+                        } else if (it.code == 401 && canReRegister) {
+                            // Revoked or unknown: a fresh token, one retry.
+                            Prefs.setAppToken(appContext, "")
+                            register(callback) { token ->
+                                send(
+                                    targetUrl, form, desc, mapGone, token,
+                                    false, callback,
+                                )
+                            }
+                        } else if (it.code == 429) {
+                            callback(
+                                AskOutcome.Err(
+                                    Spoken.RATE_LIMITED,
+                                    "HTTP 429 retry-after=" +
+                                        it.header("Retry-After"),
+                                    plain = true,
                                 )
                             )
                         } else if (it.code == 401) {

@@ -16,6 +16,7 @@ object Prefs {
     private const val FILE = "alumbra"
     private const val KEY_BASE_URL = "base_url"
     private const val KEY_APP_TOKEN = "app_token"
+    private const val KEY_INSTALL_ID = "install_id"
     private const val KEY_LANGUAGE = "language"
     private const val KEY_SPEECH_RATE = "speech_rate"
     private const val KEY_HIGH_CONTRAST = "high_contrast"
@@ -33,12 +34,23 @@ object Prefs {
         prefs(context).edit().putString(KEY_BASE_URL, value.trim()).apply()
     }
 
-    /** The server's APP_TOKEN, entered in Settings; empty sends none. */
+    /**
+     * The app token: minted by the server on first ask (AskApi registers)
+     * or typed in Settings. Empty: the next ask registers first.
+     */
     fun appToken(context: Context): String =
         prefs(context).getString(KEY_APP_TOKEN, "") ?: ""
 
     fun setAppToken(context: Context, value: String) {
-        prefs(context).edit().putString(KEY_APP_TOKEN, value.trim()).apply()
+        prefs(context).edit().putString(KEY_APP_TOKEN, value.trim()).commit()
+    }
+
+    /** A random id for this install, made once; registration keys on it. */
+    fun installId(context: Context): String {
+        prefs(context).getString(KEY_INSTALL_ID, null)?.let { return it }
+        val id = java.util.UUID.randomUUID().toString()
+        prefs(context).edit().putString(KEY_INSTALL_ID, id).commit()
+        return id
     }
 
     fun language(context: Context): String =

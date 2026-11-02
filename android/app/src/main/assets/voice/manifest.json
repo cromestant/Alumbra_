@@ -36,6 +36,8 @@
   "try_again": "Something went wrong — please try again.",
   "back_to_ask": "New question. Hold the button to record a clip, or tap it for a photo question.",
   "bad_response": "Couldn't read the server's answer.",
+  "demo_full": "This demo isn't taking new phones right now. Please ask the person who shared it with you.",
+  "rate_limited": "You've asked a lot in a short time. Please wait a few minutes and try again.",
   "app_token_rejected": "The server didn't accept the app token. Check it in Settings.",
   "what_i_saw_show": "What I saw. Show details.",
   "what_i_saw_hide": "What I saw. Hide details.",

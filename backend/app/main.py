@@ -9,7 +9,6 @@ Request flow (design doc, section 3 "Where the bytes go"):
 from __future__ import annotations
 
 import asyncio
-import hmac
 from pathlib import Path
 
 from fastapi import (
@@ -17,9 +16,9 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import capture, escalation, metric
+from . import capture, escalation, metric, tokens
 from .pipeline import (
-    FollowupExpired, PipelineError, StageFailed, _load_secret, case_photo,
+    FollowupExpired, PipelineError, StageFailed, case_photo,
     run_ask, run_followup, sweep_ask_store,
 )
 
@@ -36,13 +35,20 @@ def _stage_failed(e: StageFailed) -> HTTPException:
     })
 
 
+def _refused(e: tokens.Refused) -> HTTPException:
+    headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+    return HTTPException(status_code=e.status, headers=headers, detail={
+        "error": e.error, "retry_after": e.retry_after or None})
+
+
 def _app_token(given: str | None) -> None:
-    """APP_TOKEN gates /ask and /followup (X-App-Token header, entered
-    in the app's Settings). Unset: the check is off."""
-    want = _load_secret("APP_TOKEN").strip()
-    if want and not hmac.compare_digest(
-            (given or "").encode(), want.encode()):
-        raise HTTPException(status_code=401, detail="bad app token")
+    """With APP_TOKEN set, /ask and /followup need X-App-Token: a token
+    from /v1/register (rate-limited, tokens.py) or APP_TOKEN itself.
+    Unset: the check is off. Checked before anything is captured."""
+    try:
+        tokens.admit_ask(tokens.check(given))
+    except tokens.Refused as e:
+        raise _refused(e)
 
 
 def _escalation_on() -> None:
@@ -77,6 +83,19 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok"}
+
+    @app.post("/v1/register")
+    async def register(body: dict = Body(...)) -> dict:
+        """An install with no token gets one: {"install_id"} ->
+        {"token", "id"}. 404 with the gate off (the app then asks
+        without a token); 403 when full or banned; 429 at the mint
+        rate."""
+        if not tokens.registration_enabled():
+            raise HTTPException(status_code=404, detail="Not Found")
+        try:
+            return tokens.register(str(body.get("install_id", "")))
+        except tokens.Refused as e:
+            raise _refused(e)
 
     @app.post("/v1/asks")
     async def ask() -> JSONResponse:

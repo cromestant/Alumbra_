@@ -87,6 +87,14 @@ object Spoken {
             "for a photo question."
     const val BAD_RESPONSE = "Couldn't read the server's answer."
     // HTTP 401 on /ask or /followup: spoken as-is, no "Sorry" wrap.
+    // Self-registration (AskApi): the demo's token pool is full or this
+    // install was turned off; and the per-phone ask limit.
+    const val DEMO_FULL =
+        "This demo isn't taking new phones right now. Please ask the " +
+            "person who shared it with you."
+    const val RATE_LIMITED =
+        "You've asked a lot in a short time. Please wait a few minutes " +
+            "and try again."
     const val APP_TOKEN_REJECTED =
         "The server didn't accept the app token. Check it in Settings."
 
