@@ -32,7 +32,9 @@ echo "deploying: $(git log --oneline -1)  (was ${PREV:0:7})"
 # download/ holds the APK, uploaded by hand, so the sync never touches it.
 SITE=/var/www/alumbra
 if [ -d "$SITE" ]; then
-  rsync -a --delete --exclude /download/ site/ "$SITE/"
+  # nginx (www-data) must read it whatever the checkout's umask made.
+  rsync -a --delete --chmod=D755,F644 --exclude /download/ site/ "$SITE/"
+  chmod 755 "$SITE"
   echo "site synced to $SITE"
 else
   echo "no $SITE: site not synced (see deploy/alumbra-nginx.conf)"
