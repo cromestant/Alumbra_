@@ -2035,6 +2035,54 @@ if _fa:
         _j = p.join_mp3([f.read_bytes() for f in _sp])
         check("join_mp3: two real Voxtral clips -> one valid MP3", p._is_mp3(_j or b""), True)
 
+# SAM backup: a call still running after SAM_BACKUP_S gets a copy.
+import os as _os, threading as _th, time as _time
+_real_once = p._sam_once
+_bk_calls = []
+def _bk_stub(plan):
+    """plan: per call, (seconds, result or exception)."""
+    lock = _th.Lock()
+    def once(img, phrase):
+        with lock:
+            i = len(_bk_calls)
+            _bk_calls.append(phrase)
+        delay, out = plan[min(i, len(plan) - 1)]
+        _time.sleep(delay)
+        if isinstance(out, Exception):
+            raise out
+        return out
+    return once
+def _bk_run(plan):
+    _bk_calls.clear()
+    p._sam_once = _bk_stub(plan)
+    t = _time.time()
+    try:
+        out = p.sam_segment(b"img", "curb")
+    except Exception as e:
+        out = type(e).__name__
+    return out, len(_bk_calls), round(_time.time() - t, 1)
+_os.environ["SAM_BACKUP_S"] = "0.2"
+check("sam backup: a fast call gets no backup",
+      _bk_run([(0, ["a"])])[:2], (["a"], 1))
+check("sam backup: a slow call's backup answers first",
+      _bk_run([(1.0, ["slow"]), (0, ["backup"])]), (["backup"], 2, 0.2))
+check("sam backup: the original still wins when it lands first",
+      _bk_run([(0.4, ["orig"]), (1.0, ["backup"])])[:2], (["orig"], 2))
+check("sam backup: a fast error raises without a backup",
+      _bk_run([(0, RuntimeError("down"))])[:2], ("RuntimeError", 1))
+check("sam backup: a slow error falls back to the backup",
+      _bk_run([(0.5, RuntimeError("down")), (0.6, ["backup"])])[:2],
+      (["backup"], 2))
+check("sam backup: both failing raises the last error",
+      _bk_run([(0.6, RuntimeError("a")), (0.1, ValueError("b"))])[:2],
+      ("RuntimeError", 2))
+_os.environ["SAM_BACKUP_S"] = "0"
+check("SAM_BACKUP_S=0: no backup however slow",
+      _bk_run([(0.4, ["orig"]), (0, ["backup"])])[:2], (["orig"], 1))
+_os.environ.pop("SAM_BACKUP_S")
+check("sam backup: default 8 s", p.sam_backup_s(), 8.0)
+p._sam_once = _real_once
+
 # Stage timings: recorded per ask, off with STAGE_TIMES_ENABLED=0
 import os as _os
 p._begin_stage_times()

@@ -992,8 +992,54 @@ WIRE_RECORD_RE = re.compile(
 WIRE_LINE_RE = re.compile(r"^<(?P<frame>\d+)f>")
 
 
+# A SAM call still running after SAM_BACKUP_S gets a backup copy; the
+# first to succeed answers. Profile 2026-11-02: median call 2.6 s, 1 in
+# 61 over 8 s (11.9 s), and a 92.6 s one held an ask; at 5 s, 6 of 7
+# backups would have lost to the original. The loser runs on, unused.
+SAM_BACKUP_DEFAULT_S = 8.0
+
+
+def sam_backup_s() -> float:
+    """Seconds before a SAM call gets a backup (env SAM_BACKUP_S); 0 off."""
+    try:
+        v = float(os.environ.get("SAM_BACKUP_S", SAM_BACKUP_DEFAULT_S))
+    except ValueError:
+        return SAM_BACKUP_DEFAULT_S
+    return v if v >= 0 else SAM_BACKUP_DEFAULT_S
+
+
 def sam_segment(image: bytes, phrase: str) -> list[dict[str, Any]]:
-    """One image + noun phrase -> records: {box, confidence}."""
+    """One image + noun phrase -> records: {box, confidence}, with a
+    backup call when the first is slow (sam_backup_s). Both failing
+    raises the last error (the stage's retry decides what follows)."""
+    wait_s = sam_backup_s()
+    if not wait_s:
+        return _sam_once(image, phrase)
+    pool = _Pool(max_workers=2)
+    try:
+        first = pool.submit(_sam_once, image, phrase)
+        try:
+            return first.result(timeout=wait_s)
+        except concurrent.futures.TimeoutError:
+            pass
+        start = time.time()
+        backup = pool.submit(_sam_once, image, phrase)
+        # In the ask's stage timings: n = backups sent / backups used.
+        _record_stage("sam_backup", start)
+        error: BaseException | None = None
+        for f in concurrent.futures.as_completed((first, backup)):
+            if f.exception() is None:
+                if f is backup:
+                    _record_stage("sam_backup_won", start)
+                return f.result()
+            error = f.exception()
+        raise error  # type: ignore[misc]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _sam_once(image: bytes, phrase: str) -> list[dict[str, Any]]:
+    """One SAM call: image + noun phrase -> records."""
     b64 = base64.b64encode(image).decode("ascii")
     text = _stream_output_text(
         {
