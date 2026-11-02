@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Volunteer escalation</title>
+<meta name="description" content="When Alumbra hands a question to a human volunteer, how the handoff works, and what the volunteer sees.">
+<link rel="icon" href="img/icon-64.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="img/icon-64.png" alt=""><span>ALUMBRA<span class="dot">.</span></span></a>
+    <nav aria-label="Site">
+      <a href="/">Home</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="escalation.html" aria-current="page">Escalation</a>
+      <a href="roadmap.html">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+<h1>Volunteer escalation</h1>
+<p class="lede">AI handles the everyday; people handle the hard. Some questions should never be decided by a model alone. For those, Alumbra hands the question to a human volunteer and keeps the user informed while it waits.</p>
+
+<h2>Which questions are escalated</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Question type</th><th>Example</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Crossing a street, or a traffic signal's state</td><td>"Can I cross now?" "Is the light green?"</td><td><strong>Escalated.</strong> Alumbra describes what it sees but never tells you to go.</td></tr>
+<tr><td>Taking a dose of medication</td><td>"Can I take two of these now?" "What's the dose?"</td><td><strong>Escalated.</strong></td></tr>
+<tr><td>Eating or drinking something</td><td>"Is this safe to eat?"</td><td>Not escalated. A fixed reply: Alumbra can't tell from a photo whether it's OK for you, so check with someone who knows.</td></tr>
+<tr><td>Everything else</td><td>"Where are my keys?" "Is the path clear?"</td><td>Answered by Alumbra, with hazard warnings.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Reading a medicine label ("which one is the ibuprofen?") is answered normally. Only the decision to take a dose goes to a person.</p>
+
+<h3>How the decision is made</h3>
+<p>Two independent layers check every question, and either one is enough to escalate:</p>
+<ol>
+  <li><strong>Word patterns</strong> in the code, such as "cross" together with "street", "now" or "safe"; "can I take", "what's the dose", "side effects"; "eat", "drink", "poison". These always work, even if the classifier service is down.</li>
+  <li><strong>Jev intent scores</strong> <span class="chip jev">Jev</span>: a fast classifier scores the question against questions like "Does this ask for a decision about crossing a street or moving into traffic?" A score of 0.5 or more counts. Signal questions ("is it green?") only count when the scene has a street, road, crosswalk, intersection, curb or car in it.</li>
+</ol>
+<p>Jev also scores whether the scene looks dangerous for a blind pedestrian. Those scores are logged for study but never change the answer.</p>
+
+<h3>What the answer says</h3>
+<ul>
+  <li>Any "go ahead" wording ("it's safe to cross") is replaced with a description of the scene and "I can't make crossing decisions."</li>
+  <li>In street scenes, sentences claiming there is no traffic are removed. A missed car is the error that matters.</li>
+  <li>"I'm connecting you to a volunteer who can help with this directly." is always included.</li>
+  <li>The final polish step is skipped, so nothing can come between the user and the handoff.</li>
+</ul>
+
+<h2>The handoff, step by step</h2>
+<figure class="diagram">
+<ol class="flow" aria-label="Steps of a volunteer escalation">
+  <li><div class="t">1. The ask is escalated <span class="chip code">Server</span></div>
+    <p class="d">The server answers as above and opens a case holding this ask's photo, the question, a short summary of the scene and Alumbra's draft answer.</p></li>
+  <li><div class="t">2. The user hears the handoff <span class="chip code">App</span></div>
+    <p class="d">"I'm not sure I can help you, hold on while I try to get a hold on someone to help us", then what Alumbra could see, then "Waiting for a volunteer. Tap Stop waiting at any time." A countdown shows the time left.</p></li>
+  <li><div class="t">3. The app waits <span class="chip code">App</span></div>
+    <p class="d">It checks the case every 3 seconds, for up to 2 minutes.</p></li>
+  <li class="human"><div class="t">4. A volunteer answers <span class="chip human">Volunteer</span></div>
+    <p class="d">The volunteer console lists open cases with the photo, the question, the scene summary and the draft. The volunteer types their name and a reply.</p></li>
+  <li class="key"><div class="t">5. The reply is delivered, attributed <span class="chip code">App</span></div>
+    <p class="d">The app shows and speaks it as "Sam, a volunteer, says: …". A volunteer's words are never presented as Alumbra's own, on screen, in speech or in the app's history.</p></li>
+</ol>
+<figcaption>If no one answers in time: "I couldn't reach a volunteer this time. You can ask me again, or try a new photo." If the user taps Stop waiting, the case is cancelled: "Stopped waiting for a volunteer."</figcaption>
+</figure>
+
+<h2>Case lifecycle</h2>
+<div class="states" role="img" aria-label="A case starts pending. From pending it becomes answered when a volunteer replies, cancelled when the user stops waiting, or expired when the 2 minute window passes.">
+  <span class="state start">pending</span>
+  <span class="arrow">→ volunteer replies →</span><span class="state ok">answered</span>
+</div>
+<div class="states" aria-hidden="true">
+  <span class="state start">pending</span>
+  <span class="arrow">→ user stops waiting →</span><span class="state end">cancelled</span>
+</div>
+<div class="states" aria-hidden="true">
+  <span class="state start">pending</span>
+  <span class="arrow">→ 2 minutes pass →</span><span class="state end">expired</span>
+</div>
+
+<h2>Privacy</h2>
+<ul>
+  <li>A case carries only its own ask: one photo, the question, the scene summary and the draft. Nothing else from the user's history reaches the volunteer.</li>
+  <li>The photo is not copied into the case; the console loads it from the ask while the ask is still held (up to an hour).</li>
+  <li>The console needs a volunteer access key. The app can only check on, or cancel, its own case.</li>
+</ul>
+
+<h2>Limits of this version</h2>
+<div class="note warn">
+<ul>
+  <li>Cases live in the server's memory. A server restart loses pending cases.</li>
+  <li>One shared access key covers all volunteers. It marks the edge of the demo; it is not a security model. A real service needs volunteer accounts, vetting and a dispatch that reaches volunteers where they are.</li>
+  <li>Escalation only works while a volunteer has the console open. If the volunteer service is switched off, no case is opened and nobody is kept waiting.</li>
+</ul>
+</div>
+
+<p class="small">Continue: <a href="how-it-works.html">how Alumbra works</a> · <a href="benchmarks.html">benchmarks</a> · <a href="roadmap.html">roadmap</a></p>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">Alumbra, visual assistance for blind and low-vision people. Built for the Meta AI Developer Hackathon, October 26 to November 4, 2026. Test version.</div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alumbra roadmap</title>
+<meta name="description" content="Improvements to Alumbra that were measured or designed but not yet built, and what a real release would need.">
+<link rel="icon" href="img/icon-64.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="img/icon-64.png" alt=""><span>ALUMBRA<span class="dot">.</span></span></a>
+    <nav aria-label="Site">
+      <a href="/">Home</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="escalation.html">Escalation</a>
+      <a href="roadmap.html" aria-current="page">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+<h1>Roadmap</h1>
+<p class="lede">Ideas that came out of testing and measurement but are not built yet. Each one says why it matters and what it would cost.</p>
+
+<h2>Seeing more, more reliably</h2>
+
+<h3>Fall back to a general word when a search finds nothing</h3>
+<p>Asked "Where is my ragdoll?", SAM found nothing under the word "ragdoll" (a cat breed). Spark, looking at the photo, placed the cat correctly, but that position was unmeasured. Asked "How many mailbox banks?", Alumbra once said there were none, because the specific phrase matched nothing.</p>
+<p><strong>Plan:</strong> as soon as the question is known, ask a fast model for the everyday word ("ragdoll" → "cat", "mailbox bank" → "mailbox"). If the specific search finds nothing, search for the general word, and report what it finds under the user's own word.</p>
+<ul>
+  <li><strong>Cost:</strong> no added time when the first search succeeds. About 4 seconds on a "where is" miss; none on a count miss, which finishes during naming.</li>
+  <li><strong>If it finds several</strong> ("two cats"), say so rather than guess which one.</li>
+  <li><strong>If nothing is found at all</strong> but the answer model sees it, say the position is a rough one ("I think it's at 10 o'clock, but I couldn't locate it exactly").</li>
+</ul>
+
+<h3>Combine two models' lists of what is in the scene</h3>
+<p>Spark and the Baseten model each miss objects the other names: a fire hydrant on a sidewalk, a path through a garden, a charging cable on a desk (<a href="benchmarks.html#naming">benchmark</a>). Baseten's list arrives about a second sooner, so searching both lists together adds little delay. Objects only one model named would still be located by SAM, and a wrong name is dropped when the search finds nothing.</p>
+<ul><li><strong>Cost:</strong> one extra model call and about 5 more searches per ask.</li></ul>
+
+<h3>Use more of a video clip</h3>
+<p>A clip ask once missed apples that were visible in the clip but not in the middle frame used for naming. Options: name objects in several frames, or pick the sharpest frame instead of the middle one.</p>
+
+<h3>Skip the standard hazard searches on count questions</h3>
+<p>Every ask searches for cars, people, stairs, doors and curbs. A count question doesn't use them, so skipping them would save about 5 searches. To be done carefully: those searches exist for safety.</p>
+
+<h2>Speed and cost</h2>
+<ul>
+  <li><strong>Settle disagreements in model races.</strong> The Baseten model wins most floor-read races by speed but has mislabelled spilled ice as "teeth". Options: use Spark's reading when the two disagree, or report a hazard only when both agree.</li>
+  <li><strong>Drop a race that never helps.</strong> On path answers both models always added nothing; that call can probably go.</li>
+  <li><strong>Stop paying for losing calls.</strong> When a race or a backup search is decided, the losing call keeps running and is still billed.</li>
+  <li><strong>Don't name the scene for "where is" questions.</strong> With a spoken question, naming starts before the question is known, and a "where is" question then throws it away (10.5 seconds of model time in the first live ask).</li>
+  <li><strong>Revisit the final polish step.</strong> It only runs on long drafts, which live asks rarely produce.</li>
+</ul>
+
+<h2>Toward a real release</h2>
+<p>This version is a test build. A public release would need:</p>
+<ul>
+  <li><strong>Accounts and app attestation</strong> (for example Play Integrity) instead of the test app's self-registration and per-phone limits.</li>
+  <li><strong>A real volunteer service:</strong> volunteer accounts and vetting, notifications that reach volunteers wherever they are, and cases that survive a server restart.</li>
+  <li><strong>Persistent follow-ups</strong> with a clear retention policy, instead of in-memory storage.</li>
+  <li><strong>Play Store distribution</strong>, with a release build signed for the store.</li>
+  <li><strong>Testing with blind and low-vision users</strong> across many more scenes, lighting conditions and phones.</li>
+</ul>
+
+<p class="small">Continue: <a href="how-it-works.html">how Alumbra works</a> · <a href="benchmarks.html">benchmarks</a> · <a href="escalation.html">escalation</a></p>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">Alumbra, visual assistance for blind and low-vision people. Built for the Meta AI Developer Hackathon, October 26 to November 4, 2026. Test version.</div>
+</footer>
+</body>
+</html>

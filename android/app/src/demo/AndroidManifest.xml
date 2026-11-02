@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Demo build: the cloud server only, so no local-network permission
+     ("Nearby devices") is declared. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission
+        android:name="android.permission.ACCESS_LOCAL_NETWORK"
+        tools:node="remove" />
+</manifest>

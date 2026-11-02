@@ -28,6 +28,16 @@ echo "deploying: $(git log --oneline -1)  (was ${PREV:0:7})"
 # Cheap enough to run every deploy; a no-op unless requirements moved.
 .venv/bin/pip install -q -r backend/requirements.txt
 
+# The public site (deploy/alumbra-nginx.conf serves /var/www/alumbra).
+# download/ holds the APK, uploaded by hand, so the sync never touches it.
+SITE=/var/www/alumbra
+if [ -d "$SITE" ]; then
+  rsync -a --delete --exclude /download/ site/ "$SITE/"
+  echo "site synced to $SITE"
+else
+  echo "no $SITE: site not synced (see deploy/alumbra-nginx.conf)"
+fi
+
 sudo systemctl restart alumbra-api
 
 for i in $(seq 1 15); do

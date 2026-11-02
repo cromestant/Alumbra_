@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alumbra</title>
+<meta name="description" content="Alumbra: point your phone, ask a question, and hear where things are. Visual assistance for blind and low-vision people. Download the Android test build.">
+<link rel="icon" href="img/icon-64.png">
+<link rel="apple-touch-icon" href="img/icon-192.png">
+<meta property="og:title" content="Alumbra">
+<meta property="og:description" content="Point your phone, ask a question, and hear where things are.">
+<meta property="og:image" content="/img/icon-512.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/" aria-current="page"><img src="img/icon-64.png" alt=""><span>ALUMBRA<span class="dot">.</span></span></a>
+    <nav aria-label="Site">
+      <a href="/" aria-current="page">Home</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="escalation.html">Escalation</a>
+      <a href="roadmap.html">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+<section class="hero">
+  <div>
+    <h1>Point your phone. Ask. Hear where things are.</h1>
+    <p class="lede">Alumbra is a visual assistant for blind and low-vision people. It answers with directions you can act on: not "a kitchen", but "the red mug is at your 2 o'clock, about a meter away, left of the sink".</p>
+    <p><a class="btn" href="/download/alumbra.apk" download>Download for Android</a></p>
+    <p class="small">Test build (APK) · Android 8.0 or newer · free to try while the test runs</p>
+  </div>
+  <img src="img/icon-512.png" alt="The Alumbra mark: a letter A and a dot casting a beam of amber light.">
+</section>
+
+<p class="quote">AI handles the everyday; people handle the hard.</p>
+
+<h2>What it does</h2>
+<ul>
+  <li><strong>Ask about anything in view.</strong> "What's in front of me?" "Where are my glasses?" "How many chairs are there?"</li>
+  <li><strong>Directions you can use.</strong> Clock positions and distances, measured from the photo rather than guessed.</li>
+  <li><strong>Path checks.</strong> "Is the way to the door clear?" gets a computed yes or no, with any obstacle named. In the dark, it says it can't tell rather than guess.</li>
+  <li><strong>Labels.</strong> "Which bottle is the ibuprofen?" reads the labels and tells you where it is.</li>
+  <li><strong>A person for the hard questions.</strong> Crossing a street or taking a dose of medicine goes to a human volunteer, never to the AI alone.</li>
+  <li><strong>Built for screen readers.</strong> One large button, spoken status, and every control labelled for TalkBack.</li>
+</ul>
+
+<h2>Try it</h2>
+<ol class="steps">
+  <li><strong>Download the APK</strong> on your Android phone with the button above.</li>
+  <li><strong>Allow the install.</strong> Android will ask you to allow installs from your browser ("Install unknown apps"). This is a test build, so it is not in the Play Store yet.</li>
+  <li><strong>Open Alumbra</strong> and allow the camera and microphone.</li>
+  <li><strong>Tap the big button</strong> to take a photo, then say your question. Or press and hold to record a short clip while you talk. You can also type the question.</li>
+  <li><strong>Listen.</strong> The answer is spoken and shown on screen. Ask a follow-up without taking a new photo.</li>
+</ol>
+
+<div class="note">
+<p><strong>About this test version</strong></p>
+<ul>
+  <li>No account needed. The app registers itself the first time you ask.</li>
+  <li>Each phone can ask 10 questions every 5 minutes. If the test is full, the app says so.</li>
+  <li>Answers take about 25 to 35 seconds. The app tells you it's working.</li>
+  <li>Alumbra can be wrong. Don't rely on it for your safety; use your cane, your dog, and people around you.</li>
+</ul>
+</div>
+
+<h2>Learn more</h2>
+<div class="cards">
+  <a class="card" href="how-it-works.html"><b>How it works</b><span>The pipeline from photo to spoken answer, and which model does which job, with flow diagrams.</span></a>
+  <a class="card" href="benchmarks.html"><b>Benchmarks</b><span>Every test we ran: the eval suite, model races, latency profiles, and what changed because of them.</span></a>
+  <a class="card" href="escalation.html"><b>Volunteer escalation</b><span>Which questions go to a person, how the handoff works, and what the volunteer sees.</span></a>
+  <a class="card" href="roadmap.html"><b>Roadmap</b><span>Improvements measured or designed but not built yet, and what a real release needs.</span></a>
+</div>
+
+<h2>Your data</h2>
+<ul>
+  <li><strong>Photos are not stored.</strong> A photo is kept in the server's memory for up to an hour so follow-up questions work, then discarded.</li>
+  <li><strong>Who sees what:</strong> the photo goes to the vision models (Meta's Model API, and Baseten for some parts). The question and a text summary of the scene go to the Jev intent classifier. The answer text goes to Mistral to be voiced.</li>
+  <li><strong>Volunteers</strong> see only the photo, question and scene summary of an ask that was handed to them.</li>
+  <li>The app keeps your recent questions and answers on your phone, in its History.</li>
+</ul>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">Alumbra, visual assistance for blind and low-vision people. Built for the Meta AI Developer Hackathon, October 26 to November 4, 2026. Test version.</div>
+</footer>
+</body>
+</html>

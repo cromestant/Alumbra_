@@ -23,11 +23,22 @@ android {
         // (LAN / Tailscale presets for the dev server).
         buildConfigField("String", "DEFAULT_BASE_URL",
             "\"https://alumbra.onthe1.app\"")
+        // Dev servers: the LAN/Tailscale presets, cleartext to them and
+        // the local-network permission. Off in the demo build.
+        buildConfigField("boolean", "DEV_SERVERS", "true")
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+        // The public test APK (assembleDemo): debug-signed like the dev
+        // build, so it installs over it, minus everything for dev servers
+        // (src/demo drops the permission and the cleartext exceptions).
+        create("demo") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+            buildConfigField("boolean", "DEV_SERVERS", "false")
         }
     }
     buildFeatures {

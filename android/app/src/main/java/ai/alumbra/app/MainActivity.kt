@@ -321,6 +321,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
      * cloud-only the manifest line can go too.
      */
     private fun needsLanPermission(): Boolean {
+        // The demo build doesn't declare it: asking would always fail.
+        if (!BuildConfig.DEV_SERVERS) return false
         if (Build.VERSION.SDK_INT < 37) return false
         val host = try {
             android.net.Uri.parse(Prefs.baseUrl(this)).host ?: return true

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alumbra benchmarks</title>
+<meta name="description" content="Every benchmark run on Alumbra: the eval suite, model races, latency profiles and the naming comparison, with results.">
+<link rel="icon" href="img/icon-64.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="img/icon-64.png" alt=""><span>ALUMBRA<span class="dot">.</span></span></a>
+    <nav aria-label="Site">
+      <a href="/">Home</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="benchmarks.html" aria-current="page">Benchmarks</a>
+      <a href="escalation.html">Escalation</a>
+      <a href="roadmap.html">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+<h1>Benchmarks</h1>
+<p class="lede">What we measured while building Alumbra, and what changed because of it. Samples are small (this was built in a week), so each result says how much data is behind it.</p>
+
+<div class="note amber"><p><strong>Summary.</strong> The eval suite passes 22 to 25 of 27 questions per run, with a median of about 25 seconds per ask. Most of an ask's time is the answer step and the object searches. The worst delays come from rare single searches that hang, which a backup copy now caps. The second model on Baseten is faster than Spark on short reads but makes more labelling mistakes.</p></div>
+
+<nav aria-label="On this page" class="small"><p>On this page: <a href="#eval">Eval suite</a> · <a href="#races">Spark vs Baseten races</a> · <a href="#profile">Latency profile</a> · <a href="#sam">Slow searches and backups</a> · <a href="#naming">Naming comparison</a> · <a href="#live">First live asks</a></p></nav>
+
+<h2 id="eval">1. Eval suite</h2>
+<p>A fixed set of 12 real photos (a persimmon tree, a dusk sidewalk, a mailbox bank, a kitchen with spilled ice, a desk, an office doorway and others) with 26 questions, plus one case for the final polish step. Each question has checks: the right behaviour (answer or hand off), objects that must be in the scene, and words that must be in the answer. The checks are frozen: tuning the pipeline never changes them.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Run</th><th class="num">Passed</th><th class="num">Failed</th><th class="num">Errored</th><th class="num">Run time</th></tr></thead>
+<tbody>
+<tr><td>Oct 28 15:42</td><td class="num">24</td><td class="num">3</td><td class="num">0</td><td class="num">17.3 min</td></tr>
+<tr><td>Oct 28 16:42</td><td class="num">25</td><td class="num">2</td><td class="num">0</td><td class="num">18.5 min</td></tr>
+<tr><td>Oct 29 12:30</td><td class="num">22</td><td class="num">4</td><td class="num">1</td><td class="num">32.0 min</td></tr>
+<tr><td>Oct 29 13:03</td><td class="num">24</td><td class="num">3</td><td class="num">0</td><td class="num">12.2 min</td></tr>
+<tr><td>Oct 29 14:18</td><td class="num">23</td><td class="num">4</td><td class="num">0</td><td class="num">11.8 min</td></tr>
+<tr><td>Oct 29 14:31</td><td class="num">22</td><td class="num">5</td><td class="num">0</td><td class="num">12.0 min</td></tr>
+<tr><td>Oct 29 15:53</td><td class="num">24</td><td class="num">3</td><td class="num">0</td><td class="num">11.2 min</td></tr>
+<tr><td>Oct 29 18:00</td><td class="num">23</td><td class="num">3</td><td class="num">1</td><td class="num">22.6 min</td></tr>
+<tr class="hi"><td>Oct 30 13:06 (latest)</td><td class="num">24</td><td class="num">3</td><td class="num">0</td><td class="num">15.4 min</td></tr>
+</tbody>
+</table>
+</div>
+<p>27 questions per run. The five video-clip cases were skipped in these runs. In the latest run the median time per question was 25.1 seconds.</p>
+<p>The three failures in the latest run, each a missing word in the answer:</p>
+<ul>
+  <li>"What am I stepping on?" The answer did not name the small granules underfoot.</li>
+  <li>"Help me find my mailbox, it's number 16 in the middle." The answer did not say "middle".</li>
+  <li>"Where are my glasses?" The answer did not mention the stand they rest on.</li>
+</ul>
+
+<h2 id="races">2. Spark vs Baseten races</h2>
+<p>In three places Alumbra sends the same request to Spark and to a second model, Muse Spark Open on Baseten, and uses whichever good answer comes first within its time limit. To see how that plays out, we ran 7 real asks and let both sides of every race run to completion (November 2, 2026).</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Race</th><th class="num">Races</th><th class="num">Baseten won</th><th class="num">Spark median / max</th><th class="num">Baseten median / max</th></tr></thead>
+<tbody>
+<tr><td>Floor reads (small crops)</td><td class="num">18</td><td class="num">14</td><td class="num">12.7 / 24.1 s</td><td class="num">3.2 / 5.8 s</td></tr>
+<tr><td>Answer detail (path questions)</td><td class="num">7</td><td class="num">6</td><td class="num">14.8 / 27.9 s</td><td class="num">10.9 / 12.6 s</td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+  <li><strong>Baseten is much faster on floor reads, but less accurate.</strong> On the spilled-ice photo it called ice cubes "teeth" and "garlic clove", and those words reached the spoken answer.</li>
+  <li><strong>The answer-detail race added nothing.</strong> Both models returned an empty addition every time; the code-written lead already said it all.</li>
+</ul>
+<p><strong>Final polish step</strong> (one draft answer, run 6 times):</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Setup</th><th>Times</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Baseten first, Spark as fallback</td><td>3.8, 4.5, 3.2 s; once 22.9 s (Baseten timed out, Spark took over)</td><td>Same text every time</td></tr>
+<tr><td>Spark only</td><td>18.3, 15.9 s</td><td>Same text</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="profile">3. Latency profile of one ask</h2>
+<p>A count question ("How many mailbox banks are there?") once took 145 seconds in a benchmark run. We timed every step of the same ask, repeated it, and it took 28 to 33 seconds each time. Its eval history is 15 to 32 seconds, with one 82-second run. The 145 seconds was a rare slow call, not a fixed cost.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Step</th><th class="num">Run 1</th><th class="num">Run 2</th></tr></thead>
+<tbody>
+<tr><td>Naming (Spark)</td><td class="num">5.6 s</td><td class="num">6.2 s</td></tr>
+<tr><td>Object searches (SAM, 15 to 16 in parallel)</td><td class="num">8.5 s</td><td class="num">17.5 s</td></tr>
+<tr><td>Count search (SAM)</td><td class="num">4.2 s</td><td class="num">1.9 s</td></tr>
+<tr><td>Safety gate (Jev)</td><td class="num">0.3 s</td><td class="num">0.2 s</td></tr>
+<tr><td>Answer (Spark)</td><td class="num">9.3 s</td><td class="num">7.3 s</td></tr>
+<tr class="hi"><td>Total</td><td class="num">27.9 s</td><td class="num">33.2 s</td></tr>
+</tbody>
+</table>
+</div>
+<p>Two findings changed the code:</p>
+<ul>
+  <li><strong>The count search waited for nothing.</strong> It needs only the photo and the question, but ran after all other searches. It now starts with the ask and finishes during naming, saving 2 to 4 seconds on every count question.</li>
+  <li><strong>One slow search holds the whole ask.</strong> In run 2 a single search ("curb") took 11.9 seconds while the rest took 2 to 5. That led to the backup below.</li>
+</ul>
+<p>Every ask now logs the time of each step, so slow asks can be diagnosed from the logs.</p>
+
+<h2 id="sam">4. Slow searches and backups</h2>
+<p>Across 61 SAM searches from four profiled asks: median 2.6 seconds, 90th percentile 5.4 seconds, slowest 11.9 seconds. Separately, one search on a test phone took 92.6 seconds and turned a normal ask into a 135-second one.</p>
+<p>The fix: if a search hasn't answered after a set time, send an identical copy and use whichever answers first. The question was where to set that time, since a copy that loses is a wasted call.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Send a copy after</th><th class="num">Copies sent</th><th class="num">Copies that would win</th></tr></thead>
+<tbody>
+<tr><td>5 s</td><td class="num">7 of 61 (11%)</td><td class="num">1</td></tr>
+<tr><td>6 s</td><td class="num">5 of 61 (8%)</td><td class="num">1</td></tr>
+<tr class="hi"><td>8 s (chosen)</td><td class="num">1 of 61 (2%)</td><td class="num">1</td></tr>
+</tbody>
+</table>
+</div>
+<p>At 5 seconds most copies would lose to originals finishing at 5 to 7 seconds. At 8 seconds only the genuinely stuck search gets a copy, about 2% extra searches, and a 90-second hang becomes about 11 seconds. A live check with the time forced down to 2 seconds sent 11 copies and none won, which confirms that a short limit only wastes calls.</p>
+
+<h2 id="naming">5. Naming: Spark vs Baseten</h2>
+<p>Could the faster Baseten model name scenes instead of Spark? Both got the same prompt, at the same time, on 10 eval photos, twice each (November 2, 2026). One photo with readable personal labels was left out.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Model</th><th class="num">Median</th><th class="num">Max</th><th class="num">Errors</th></tr></thead>
+<tbody>
+<tr><td><span class="chip spark">Spark</span></td><td class="num">7.4 s</td><td class="num">11.1 s</td><td class="num">0 of 20</td></tr>
+<tr><td><span class="chip baseten">Baseten</span></td><td class="num">6.3 s</td><td class="num">7.5 s</td><td class="num">0 of 20</td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+  <li><strong>Baseten was faster in 17 of 20 pairs,</strong> but only by about a second on full photos.</li>
+  <li><strong>The two lists differ about as much as two Spark runs do.</strong> Exact-phrase overlap was 0.31 between the models and 0.33 between two Spark runs on the same photo. Most differences are the same object named differently ("fallen" vs "scattered" ice cubes).</li>
+  <li><strong>Each model misses things the other finds.</strong> On a sidewalk photo Spark named a fire hydrant and a trash bin in both runs, Baseten in one. Baseten alone found a charging cable, a puddle and wet footprints.</li>
+  <li><strong>No invented objects</strong> appeared in either list.</li>
+</ul>
+<p>Result: not adopted for now. Combining both lists is on the <a href="roadmap.html">roadmap</a>.</p>
+
+<h2 id="live">6. First live asks</h2>
+<p>The first ask through the public server (November 2, 2026): "Where is my ragdoll?", spoken over a short video clip. 26.0 seconds end to end.</p>
+<figure class="diagram">
+<div class="timeline" role="img" aria-label="Timeline of a 26 second ask: transcription 0 to 2.9 seconds; naming 0 to 10.5 seconds, unused; segmentation 2.9 to 5.3 seconds; safety gate 5.3 to 5.6 seconds; answer 5.6 to 24.8 seconds; voice 24.8 to 26.0 seconds.">
+  <div class="tl-row"><span class="lbl">Transcription</span><div class="tl-track"><span class="tl-bar spark" style="left:0%;width:10.4%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Naming (unused)</span><div class="tl-track"><span class="tl-bar spark" style="left:0%;width:37.5%;opacity:.35"></span></div></div>
+  <div class="tl-row"><span class="lbl">Segmentation ×6</span><div class="tl-track"><span class="tl-bar sam" style="left:10.4%;width:8.6%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Safety gate</span><div class="tl-track"><span class="tl-bar jev" style="left:18.9%;width:1.1%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Answer</span><div class="tl-track"><span class="tl-bar spark" style="left:20%;width:68.6%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Voice</span><div class="tl-track"><span class="tl-bar voice" style="left:88.6%;width:4.3%"></span></div></div>
+  <div class="tl-axis"><div></div><div><span>0 s</span><span>7</span><span>14</span><span>21</span><span>28 s</span></div></div>
+</div>
+<figcaption>A find question doesn't use naming; it started early in case the question turned out to be an open one.</figcaption>
+</figure>
+<p>The answer, "Your ragdoll is at your 10 o'clock, to the left, a few steps away. It is on the chair beside the door", was correct. But SAM had not found the cat under the word "ragdoll", so that position came from Spark looking at the photo, not from a measured box. Falling back to a general word ("cat") when the specific one finds nothing is on the <a href="roadmap.html">roadmap</a>.</p>
+
+<h2>Method notes</h2>
+<ul>
+  <li>Latency depends on the model services' load at the time; the same ask varied by several seconds between runs.</li>
+  <li>The race and naming results come from one session each. They show direction, not stable rates.</li>
+  <li>Eval photos are real photos taken by the developer. They are not published.</li>
+</ul>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">Alumbra, visual assistance for blind and low-vision people. Built for the Meta AI Developer Hackathon, October 26 to November 4, 2026. Test version.</div>
+</footer>
+</body>
+</html>

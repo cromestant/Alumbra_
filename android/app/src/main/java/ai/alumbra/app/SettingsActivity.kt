@@ -81,6 +81,11 @@ class SettingsActivity : AppCompatActivity() {
 
         val urlField: EditText = findViewById(R.id.base_url_field)
         urlField.setText(Prefs.baseUrl(this))
+        if (!BuildConfig.DEV_SERVERS) {
+            // Demo build: no dev servers to pick.
+            (findViewById<Button>(R.id.preset_lan_button).parent as View)
+                .visibility = View.GONE
+        }
         findViewById<Button>(R.id.preset_lan_button).setOnClickListener {
             urlField.setText(Prefs.LAN_BASE_URL)
         }

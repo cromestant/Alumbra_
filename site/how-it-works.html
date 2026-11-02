@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Alumbra works</title>
+<meta name="description" content="How Alumbra turns a photo and a question into a spoken, spatially grounded answer, and which model does what.">
+<link rel="icon" href="img/icon-64.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="img/icon-64.png" alt=""><span>ALUMBRA<span class="dot">.</span></span></a>
+    <nav aria-label="Site">
+      <a href="/">Home</a>
+      <a href="how-it-works.html" aria-current="page">How it works</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="escalation.html">Escalation</a>
+      <a href="roadmap.html">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+<h1>How Alumbra works</h1>
+<p class="lede">You point your phone, ask a question out loud, and hear an answer that says where things are: "the mug is at your 2 o'clock, about a meter away". This page explains what happens in between, and which model does which job.</p>
+
+<h2>The idea in one paragraph</h2>
+<p>Models are good at seeing and describing. They are less reliable at exact positions, and on safety questions a mistake can hurt someone. So Alumbra splits the work. Models perceive: they name what is in the scene, find each object's outline and write the wording. Code decides: it turns outlines into clock directions and distances, works out whether a path is clear, and adds hazard warnings. Questions that must not be answered by a model alone, such as whether to cross a street, go to a human volunteer.</p>
+
+<h2>The models</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Model</th><th>Where it runs</th><th>What it does in Alumbra</th></tr></thead>
+<tbody>
+<tr><td><span class="chip spark">Muse Spark</span></td><td>Meta Model API</td><td>Names the objects in a scene. Writes the answer. Reads labels on medicine and packaging. Reads small crops of the floor for hazards.</td></tr>
+<tr><td><span class="chip sam">SAM 3.1</span></td><td>Meta Model API</td><td>Segmentation: given a phrase like "chair", finds every chair and returns its outline and box. Every position and distance Alumbra speaks comes from these boxes.</td></tr>
+<tr><td><span class="chip spark">Muse Voice Transcribe</span></td><td>Meta Model API</td><td>Turns a spoken question (or the audio of a video clip) into text.</td></tr>
+<tr><td><span class="chip baseten">Muse Spark Open</span></td><td>Baseten</td><td>A second model that races Spark on floor reads and on parts of the answer, and makes the first attempt at the final polish. Whichever usable answer arrives first within its time limit is used.</td></tr>
+<tr><td><span class="chip jev">Jev</span></td><td>Typesafe</td><td>A fast intent classifier (about 0.2&nbsp;s). It scores the question: is this about crossing a street, taking medication, eating something? It sees the question and a short text summary of the scene, never the photo.</td></tr>
+<tr><td><span class="chip voice">Voxtral</span></td><td>Mistral</td><td>Speaks the answer in a natural voice. Fixed phrases ("Sent, analyzing.") are recorded once and shipped inside the app, so they play instantly.</td></tr>
+<tr><td><span class="chip code">Code</span></td><td>Alumbra server</td><td>Geometry and rules: clock directions, metric distance, path verdicts, darkness checks, hazard warnings, the safety gate, and the handoff to a volunteer.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>One ask, end to end</h2>
+<figure class="diagram">
+<ol class="flow" aria-label="The steps of one ask">
+  <li><div class="t">1. Capture on the phone <span class="chip code">App</span></div>
+    <p class="d">Tap for a photo, or press and hold to record a short clip while you talk. The app also sends how the phone is tilted and its lens focal length, which the server uses for distances.</p></li>
+  <li><div class="t">2. The question <span class="chip spark">Voice Transcribe</span></div>
+    <p class="d">A typed question is used as is. Otherwise the spoken audio is transcribed. While that happens, naming (step 4) already starts on the photo.</p></li>
+  <li><div class="t">3. Route <span class="chip code">Code</span></div>
+    <p class="d">The question picks one of three flows: an open look at the scene, finding a named thing, or reading a label. See <a href="#flows">the three flows</a>.</p></li>
+  <li class="key"><div class="t">4. Perceive <span class="chip spark">Spark</span> <span class="chip sam">SAM 3.1</span></div>
+    <p class="d">Spark names what it sees; SAM finds each named thing, plus a fixed safety list (car, person, stairs, door, curb) on every ask. Up to 16 names, searched in parallel.</p>
+    <div class="lanes">
+      <div><b>Count questions</b><p>"How many…" starts its own SAM search the moment the question is known, alongside naming.</p></div>
+      <div><b>Path questions</b><p>Extra looks at the floor and, for doors, at the opening you would walk through.</p></div>
+      <div><b>Clips</b><p>Several frames are searched, and counts are combined across them.</p></div>
+    </div></li>
+  <li><div class="t">5. Scene model <span class="chip code">Code</span></div>
+    <p class="d">Duplicate outlines are merged. Each object gets a clock direction from where it sits left to right, and a distance (see <a href="#distance">distance</a>).</p></li>
+  <li><div class="t">6. Safety gate <span class="chip jev">Jev</span> <span class="chip code">Code</span></div>
+    <p class="d">Two layers check the question: word patterns, and Jev's intent scores. Questions about crossing a street or taking a dose of medication go to a volunteer. Eating and drinking questions get a fixed, careful reply.</p></li>
+  <li class="key"><div class="t">7. Compose <span class="chip code">Code</span> <span class="chip spark">Spark</span> <span class="chip baseten">Baseten</span></div>
+    <p class="d">For path questions the code writes the verdict first ("Yes, the way ahead is clear" or "Careful, a chair is in your path"). Spark then writes the answer from the scene model and the photo. Hazards the code found are always added, word for word.</p></li>
+  <li><div class="t">8. Polish <span class="chip baseten">Baseten</span> <span class="chip spark">Spark</span></div>
+    <p class="d">A final pass trims long drafts. Safety sentences are locked and pass through unchanged. Skipped for short answers and for volunteer handoffs.</p></li>
+  <li><div class="t">9. Speak <span class="chip voice">Voxtral</span></div>
+    <p class="d">The answer is voiced on the server and played on the phone. If the voice service fails, the phone speaks the same words with its own voice.</p></li>
+</ol>
+<figcaption>Each model step retries once. If it still fails, the ask stops with "Something went wrong, please try again" rather than answering from a partial scene.</figcaption>
+</figure>
+
+<h2 id="flows">The three flows</h2>
+<div class="lanes" role="list">
+  <div role="listitem"><b>A. Open scene</b><p>"What's in front of me?" "Is the path clear?" Spark names everything it sees, SAM locates each name plus the safety list.</p></div>
+  <div role="listitem"><b>B. Find a named thing</b><p>"Where are my glasses?" SAM searches for the named thing directly, plus the safety list.</p></div>
+  <div role="listitem"><b>C. Read a label</b><p>"Which one is the ibuprofen?" SAM finds the bottles or boxes, each one is cropped, and Spark reads its label.</p></div>
+</div>
+
+<h2>Where the time goes</h2>
+<p>A typical ask takes 25 to 35 seconds. Below is a real count question ("How many mailbox banks are there?"), measured on November 2, 2026. Bars that overlap ran at the same time.</p>
+<figure class="diagram">
+<div class="timeline" role="img" aria-label="Timeline of a 28.9 second ask: count look-up 0.1 to 2.1 seconds; naming 0.1 to 8.6 seconds; segmentation 8.6 to 18.2 seconds; safety gate 18.2 to 18.5 seconds; answer 18.5 to 28.9 seconds.">
+  <div class="tl-row"><span class="lbl">Count look-up</span><div class="tl-track"><span class="tl-bar sam" style="left:0.4%;width:6.6%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Naming</span><div class="tl-track"><span class="tl-bar spark" style="left:0.4%;width:26.4%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Segmentation ×14</span><div class="tl-track"><span class="tl-bar sam" style="left:26.8%;width:30%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Safety gate</span><div class="tl-track"><span class="tl-bar jev" style="left:56.8%;width:1%"></span></div></div>
+  <div class="tl-row"><span class="lbl">Answer</span><div class="tl-track"><span class="tl-bar spark" style="left:57.8%;width:32.5%"></span></div></div>
+  <div class="tl-axis"><div></div><div><span>0 s</span><span>8</span><span>16</span><span>24</span><span>32 s</span></div></div>
+</div>
+<figcaption>Total 28.9 s. The voice adds about 1 s on top. More measurements are on the <a href="benchmarks.html">benchmarks page</a>.</figcaption>
+</figure>
+<p>Three things keep this down:</p>
+<ul>
+  <li><strong>Work that doesn't depend on anything starts at once.</strong> Naming runs while a spoken question is transcribed; a count's own search runs during naming.</li>
+  <li><strong>Searches run in parallel.</strong> All the SAM searches for one ask go out together.</li>
+  <li><strong>Slow calls get a backup.</strong> If one SAM search hasn't answered after 8 seconds, an identical copy is sent and the first answer wins. Normally a search takes about 2.6 seconds, but rarely one hangs for over a minute and holds up the whole ask.</li>
+</ul>
+
+<h2>Path questions</h2>
+<p>"Is the path clear?" and "Can I get to the door?" get extra care, because a wrong "yes" is the worst possible answer.</p>
+<ul>
+  <li><strong>The verdict is computed, not written by a model.</strong> The code finds the goal (or straight ahead), draws the corridor you would walk through, and checks which objects stand on the floor inside it.</li>
+  <li><strong>The floor gets its own look.</strong> Small things on the floor (a toy, spilled ice) are easy to miss in a whole-scene view, so likely floor areas are cropped and read separately.</li>
+  <li><strong>Doors are checked for the opening.</strong> The door leaf is not the way through; the gap is.</li>
+  <li><strong>Darkness is measured.</strong> If the photo is too dark, Alumbra will not say the way is clear. It says it can't tell.</li>
+</ul>
+
+<h2 id="distance">Distance</h2>
+<p>With the phone's tilt and focal length, distance comes from geometry instead of guesswork:</p>
+<ul>
+  <li><strong>Things on the floor:</strong> the ray from the camera to the bottom of the object meets the floor at a distance set by the phone's height and tilt.</li>
+  <li><strong>Doors, people and cars:</strong> their usual real height, compared with how tall they appear, gives the distance.</li>
+</ul>
+<p>Distance only changes how far things are said to be and the order they are mentioned. It never decides whether something counts as a hazard.</p>
+
+<h2>Follow-up questions</h2>
+<p>After an answer you can ask a follow-up ("how far is it?") without taking a new photo. The server keeps the ask's scene for up to an hour, so a follow-up skips the naming and searching and only runs the new parts.</p>
+
+<h2>Access in this test version</h2>
+<p>This is a test app, so there is no account. On first use the app registers itself with the server and receives its own token. Each phone can make 10 asks every 5 minutes, follow-ups included, and the server caps the total number of phones and asks per hour. A real release would use proper sign-in and app attestation instead.</p>
+
+<p class="small">Continue: <a href="escalation.html">how volunteer escalation works</a> · <a href="benchmarks.html">benchmarks</a> · <a href="roadmap.html">roadmap</a></p>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">Alumbra, visual assistance for blind and low-vision people. Built for the Meta AI Developer Hackathon, October 26 to November 4, 2026. Test version.</div>
+</footer>
+</body>
+</html>
