@@ -1248,6 +1248,9 @@ def _call(path, **kw):
     except Exception as e:
         return None, e
 _real_ask, _real_fu = _main.run_ask, _main.run_followup
+# APP_TOKEN off for these checks whatever the local .env says.
+_real_ls = _main._load_secret
+_main._load_secret = lambda n: "" if n == "APP_TOKEN" else _real_ls(n)
 _main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
     trace.update({"ask_id": "abc", "scene_full": [{"name": "cat"}] * 2}),
     {"answer": "I can see two cats in this photo.", "ask_id": "abc"})[1]
@@ -1272,6 +1275,30 @@ _main.run_followup = lambda ask_id, q, a, trace, cap=None: (
     trace.update({"ask_id": "def", "parent_ask_id": ask_id}),
     {"answer": "None.", "ask_id": "def"})[1]
 _call("/followup", ask_id="abc", question="how many cups", audio=None)
+_f = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "request.json").read_text())
+# APP_TOKEN: X-App-Token required on /ask and /followup when set.
+_tok_ask = lambda t: _call("/ask", image=_Upload(_io.BytesIO(_live_jpeg),
+                           filename="p.jpg"), question="how many cats",
+                           media=None, audio=None, x_app_token=t)
+_tok_fu = lambda t: _call("/followup", ask_id="abc", question="how many cups",
+                          audio=None, x_app_token=t)
+_code = lambda r: getattr(r[1], "status_code", 200 if r[0] else None)
+_stalled = _main.run_ask
+_main.run_ask = lambda img, q, m, a, trace, cap=None, camera=None: (
+    trace.update({"ask_id": "abc"}), {"answer": "Two cats.", "ask_id": "abc"})[1]
+_main._load_secret = lambda n: "s3cret" if n == "APP_TOKEN" else _real_ls(n)
+_n0 = len(list(_tmp.glob("*/*")))
+check("app token set: missing, wrong, right on /ask",
+      [_code(_tok_ask(t)) for t in (None, "", "nope", "s3cret")],
+      [401, 401, 401, 200])
+check("app token set: missing, wrong, right on /followup",
+      [_code(_tok_fu(t)) for t in (None, "nope", "s3cret")], [401, 401, 200])
+check("app token: a rejected ask leaves no capture",
+      len(list(_tmp.glob("*/*"))) - _n0, 2)  # the two accepted calls only
+_main._load_secret = lambda n: "" if n == "APP_TOKEN" else _real_ls(n)
+check("app token unset: no header needed",
+      (_code(_tok_ask(None)), _code(_tok_fu(None))), (200, 200))
+_main.run_ask = _stalled
 _f = _json.loads((sorted(_tmp.glob("*/*"))[-1] / "request.json").read_text())
 check("capture: follow-up names its parent ask",
       (_f["endpoint"], _f["parent_ask_id"]), ("followup", "abc"))
@@ -1921,6 +1948,21 @@ if _fa:
     if len(_sp) == 2:
         _j = p.join_mp3([f.read_bytes() for f in _sp])
         check("join_mp3: two real Voxtral clips -> one valid MP3", p._is_mp3(_j or b""), True)
+
+# Stage timings: recorded per ask, off with STAGE_TIMES_ENABLED=0
+import os as _os
+p._begin_stage_times()
+p._run_stage("naming", lambda: "ok")
+_pool = p._Pool(max_workers=1)
+_pool.submit(p._run_stage, "segmentation", lambda: "ok").result()
+_pool.shutdown()
+check("stage times: caller and worker-thread stages both recorded",
+      sorted(p._stage_times_log()), ["naming", "segmentation"])
+_os.environ["STAGE_TIMES_ENABLED"] = "0"
+p._begin_stage_times()
+p._run_stage("naming", lambda: "ok")
+check("stage times off: nothing recorded", p._stage_times_log(), {})
+_os.environ.pop("STAGE_TIMES_ENABLED")
 
 # App wiring
 from app.main import app

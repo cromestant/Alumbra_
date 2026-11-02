@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import io
@@ -752,18 +753,88 @@ class _BadOutput(RuntimeError):
 STAGE_ATTEMPTS = 2  # one bounded retry, each attempt with a fresh budget
 
 
-def _run_stage(stage: str, attempt: Any) -> Any:
+# Per-ask stage timings for the ask's log line: stage -> calls, the
+# slowest call, the span from the first start to the last end (what the
+# stage cost the ask when its calls ran in parallel) and retries. Set
+# per ask by run_ask/run_followup; _Pool carries it into worker threads.
+_STAGE_TIMES: contextvars.ContextVar[dict[str, Any] | None] = \
+    contextvars.ContextVar("stage_times", default=None)
+_STAGE_LOCK = threading.Lock()
+
+
+def stage_times_enabled() -> bool:
+    """Kill switch mirrors audio_enabled(): STAGE_TIMES_ENABLED=0 off
+    (no timing, and no "stages" field in the log line)."""
+    return os.environ.get("STAGE_TIMES_ENABLED", "").strip().lower() not in (
+        "0", "false", "no", "off"
+    )
+
+
+def _begin_stage_times() -> None:
+    _STAGE_TIMES.set({"t0": time.time(), "stages": {}}
+                     if stage_times_enabled() else None)
+
+
+def _record_stage(stage: str, start: float, retries: int = 0) -> None:
+    times = _STAGE_TIMES.get()
+    if times is None:
+        return
+    end = time.time()
+    with _STAGE_LOCK:
+        st = times["stages"].setdefault(
+            stage, {"n": 0, "max": 0.0, "first": start, "last": end,
+                    "retries": 0})
+        st["n"] += 1
+        st["max"] = max(st["max"], end - start)
+        st["first"] = min(st["first"], start)
+        st["last"] = max(st["last"], end)
+        st["retries"] += retries
+
+
+def _stage_times_log() -> dict[str, Any]:
+    """{stage: {n, max_ms, wall_ms, start_ms, retries}}, start_ms from
+    the ask's start; {} outside an ask."""
+    times = _STAGE_TIMES.get()
+    if times is None:
+        return {}
+    with _STAGE_LOCK:
+        return {
+            name: {"n": st["n"], "max_ms": int(st["max"] * 1000),
+                   "wall_ms": int((st["last"] - st["first"]) * 1000),
+                   "start_ms": int((st["first"] - times["t0"]) * 1000),
+                   "retries": st["retries"]}
+            for name, st in sorted(times["stages"].items(),
+                                   key=lambda kv: kv[1]["first"])
+        }
+
+
+class _Pool(concurrent.futures.ThreadPoolExecutor):
+    """ThreadPoolExecutor that runs each task in the submitter's context,
+    so stage timings from worker threads reach the ask's log line."""
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        return super().submit(contextvars.copy_context().run, fn,
+                              *args, **kwargs)
+
+
+def _run_stage(stage: str, attempt: Any, timed_as: str | None = None) -> Any:
     """Run attempt() up to STAGE_ATTEMPTS times; StageFailed after that.
 
     Every model-backed stage goes through here, so "retry once, then
-    error" is stated once instead of per call site.
+    error" is stated once instead of per call site. timed_as: the name
+    in the stage timings when it differs from the (client-facing) stage.
     """
     last: BaseException | None = None
-    for _ in range(STAGE_ATTEMPTS):
+    start = time.time()
+    for n in range(STAGE_ATTEMPTS):
         try:
-            return attempt()
+            out = attempt()
         except Exception as e:
             last = e
+            continue
+        _record_stage(timed_as or stage, start, n)
+        return out
+    _record_stage((timed_as or stage) + "_failed", start, STAGE_ATTEMPTS - 1)
     raise StageFailed(stage, last)
 
 
@@ -975,7 +1046,7 @@ def sam_many(image: bytes, phrases: list[str]) -> dict[str, list[dict]]:
         return phrase, _run_stage(
             "segmentation", lambda: sam_segment(image, phrase))
 
-    with concurrent.futures.ThreadPoolExecutor(
+    with _Pool(
         max_workers=sam_concurrency()
     ) as pool:
         for phrase, records in pool.map(one, phrases):
@@ -2048,22 +2119,38 @@ def count_instances(
     return hits
 
 
+def _count_phrase(subject: str) -> str:
+    words = subject.split()
+    return " ".join(words[:-1] + [_singular(words[-1])])
+
+
+def count_records(image: bytes, question: str) -> list[dict[str, Any]]:
+    """The SAM call count_look merges: the asked noun on the photo. It
+    needs only the photo and question, so run_ask starts it alongside
+    perception (profile 2026-11-02: 2-4 s that waited on the SAM wave)."""
+    phrase = _count_phrase(count_subject(question) or "")
+    return _run_stage("segmentation", lambda: sam_segment(image, phrase),
+                      timed_as="count_look")
+
+
 def count_look(
     image: bytes, scene: list[dict[str, Any]], question: str,
     media: bytes | None = None,
+    records: concurrent.futures.Future | None = None,
 ) -> list[dict[str, Any]]:
     """Segment the asked noun so its instances are in the scene even
     when naming never listed it (a follow-up 'how many cups'). With the
     ask's clip, the class's instances become the union across its
-    frames (clip_union)."""
+    frames (clip_union). records: count_records already running for
+    this question; its error, if any, raises here as before."""
     subject = count_subject(question)
     if not subject:
         return scene
-    words = subject.split()
-    phrase = " ".join(words[:-1] + [_singular(words[-1])])
+    phrase = _count_phrase(subject)
     with Image.open(io.BytesIO(image)) as im:
         width, height = im.size
-    records = _run_stage("segmentation", lambda: sam_segment(image, phrase))
+    records = (records.result() if records is not None
+               else count_records(image, question))
     found = [entry_for(phrase, r["box"], r["confidence"], width, height)
              for r in records]
     scene = merge_entries(scene + found) if found else scene
@@ -2183,7 +2270,7 @@ def key_frames(
     it began; its sharpest frame is its key frame. At most CLIP_KEY_MAX
     keys (the shift grows until they fit)."""
     thumbs = [_thumb(f, tsize) for f in frames]
-    with concurrent.futures.ThreadPoolExecutor(
+    with _Pool(
         max_workers=FANOUT_WORKERS
     ) as pool:
         steps = list(pool.map(lambda k: _pan(thumbs[k], thumbs[k + 1]),
@@ -2345,7 +2432,7 @@ def sam_many_images(
         recs = _run_stage("segmentation", lambda: sam_segment(f, phrase))
         return [(r["box"], r["confidence"]) for r in recs]
 
-    with concurrent.futures.ThreadPoolExecutor(
+    with _Pool(
         max_workers=sam_concurrency()
     ) as pool:
         return list(pool.map(one, frames))
@@ -2557,7 +2644,7 @@ def flow_c(
             CROP_READ_MODEL, crop, WONDER_READ_PROMPT, READ_TIMEOUT
         ).strip())
 
-    with concurrent.futures.ThreadPoolExecutor(
+    with _Pool(
         max_workers=FANOUT_WORKERS
     ) as pool:
         labels = list(pool.map(read, crops))
@@ -2643,13 +2730,16 @@ def _floor_read(crop: bytes) -> str:
     if not baseten_enabled():
         return _run_stage("floor_look", lambda: _within(
             FLOOR_READ_DEADLINE_S, spark))
-    return _race_read(
+    start = time.time()
+    out = _race_read(
         spark,
         lambda: _baseten_complete(FLOOR_READ_PROMPT,
                                   FLOOR_READ_BASETEN_TIMEOUT,
                                   image=crop).strip(),
         FLOOR_READ_SPARK_GRACE_S, FLOOR_READ_BASETEN_TIMEOUT,
         FLOOR_READ_DEADLINE_S, "floor_look")
+    _record_stage("floor_look", start)
+    return out
 
 
 # Clip profile 2026-10-29 (after the floor fixes): the coded-lead answer
@@ -2668,7 +2758,7 @@ def _race_read(spark: Any, baseten: Any, grace_s: float,
     off, Spark alone under the deadline."""
     if not baseten_enabled():
         return _within(deadline_s, spark)
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    pool = _Pool(max_workers=2)
     try:
         f_sp = pool.submit(spark)
         f_bt = pool.submit(baseten)
@@ -2741,7 +2831,7 @@ def floor_look(
             buf.getvalue(), FLOOR_PHRASE))
 
     # Regions segment concurrently; merged in region order, as before.
-    with concurrent.futures.ThreadPoolExecutor(
+    with _Pool(
         max_workers=sam_concurrency()
     ) as pool:
         per_region = list(pool.map(seg, regions))
@@ -2775,7 +2865,7 @@ def floor_look(
 
     # One wave: every crop (at most FLOOR_MAX_BOXES) reads at once; at 5
     # workers 8 crops ran in two waves (+8 s on a clip ask, 2026-10-29).
-    with concurrent.futures.ThreadPoolExecutor(
+    with _Pool(
         max_workers=max(1, len(found))
     ) as pool:
         labels = list(pool.map(read, [b for b, _ in found]))
@@ -3614,7 +3704,7 @@ def answer_audio(answer: str, behavior: str, question_source: str
     metas = [{} for _ in script]
     try:
         # Fixed lines (usually cached) and the answer run side by side.
-        with concurrent.futures.ThreadPoolExecutor(len(script)) as pool:
+        with _Pool(len(script)) as pool:
             futs = [pool.submit(synthesize_speech, t, fixed, profile, m)
                     for (t, fixed), m in zip(script, metas)]
             parts = [f.result() for f in futs]
@@ -3649,6 +3739,7 @@ def run_ask(
     entry on disk. camera: the app's capture metadata (metric.parse_camera),
     None for an old app."""
     t0 = time.time()
+    _begin_stage_times()
     question = (question or "").strip()
     # Part A — precedence: text -> audio transcript -> clip transcript.
     # Lazy: ASR runs only when the text question is empty.
@@ -3658,7 +3749,7 @@ def run_ask(
     # discards it; its error matters only if flow A then needs it.
     naming = None
     if not question and audio_enabled() and (audio_bytes or media_bytes):
-        naming = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        naming = _Pool(max_workers=1)
         named = naming.submit(name_scene, image)
         naming.shutdown(wait=False)
     if not question and audio_enabled():
@@ -3674,6 +3765,13 @@ def run_ask(
     luminance = mean_luminance(image)
     p85 = p85_luminance(image)
     flow, target = route(question)
+    # A count question's own SAM call needs no scene: it runs while
+    # naming and segmentation do, and count_look merges it after.
+    counting = None
+    if count_subject(question):
+        pool = _Pool(max_workers=1)
+        counting = pool.submit(count_records, image, question)
+        pool.shutdown(wait=False)
 
     qualifier: str | None = None
     sam_prompt = target or ""
@@ -3695,7 +3793,7 @@ def run_ask(
     scene = merge_entries(scene)
     # A count question segments its noun, so every instance is counted
     # — across the clip's frames when the ask came with one.
-    scene = count_look(image, scene, question, media_bytes)
+    scene = count_look(image, scene, question, media_bytes, counting)
     if flow == "C" and match is not None:
         match = next((e for e in scene if e.get("match")), None)
 
@@ -4082,6 +4180,7 @@ def _compose(
         "gate": gate,
         "scene_objects": seen,
         "latency_ms": int((time.time() - t0) * 1000),
+        **({"stages": _stage_times_log()} if stage_times_enabled() else {}),
         "answer": answer[:600],
         "synth_applied": synth_applied,
         "synth_ms": synth_ms,
@@ -4215,6 +4314,7 @@ def run_followup(
     follow-up; the old one expires naturally.
     """
     t0 = time.time()
+    _begin_stage_times()
     entry = _load_ask(ask_id or "")
     image = entry["image"]
     question = (question or "").strip()
