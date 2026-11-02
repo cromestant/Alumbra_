@@ -84,8 +84,11 @@
     <string name="preset_lan_description">Use the LAN address preset</string>
     <string name="preset_tail_label">Tailscale</string>
     <string name="preset_tail_description">Use the Tailscale address preset</string>
+    <string name="settings_app_token">App token</string>
+    <string name="settings_app_token_description">App token for the server</string>
+    <string name="settings_app_token_hint">Empty for the dev server</string>
     <string name="save_server_label">Save</string>
-    <string name="save_server_description">Save the backend address</string>
+    <string name="save_server_description">Save the backend address and app token</string>
     <string name="settings_camera_tier">Camera tier</string>
     <string name="section_speaking">SPEAKING</string>
     <string name="section_display">DISPLAY</string>

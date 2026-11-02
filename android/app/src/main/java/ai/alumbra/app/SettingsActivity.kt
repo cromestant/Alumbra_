@@ -87,8 +87,11 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<Button>(R.id.preset_tail_button).setOnClickListener {
             urlField.setText(Prefs.TAILSCALE_BASE_URL)
         }
+        val tokenField: EditText = findViewById(R.id.app_token_field)
+        tokenField.setText(Prefs.appToken(this))
         findViewById<Button>(R.id.save_server_button).setOnClickListener {
             Prefs.setBaseUrl(this, urlField.text.toString())
+            Prefs.setAppToken(this, tokenField.text.toString())
             Haptics.pulse(this)
             finish()
         }

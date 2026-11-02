@@ -86,6 +86,9 @@ object Spoken {
         "New question. Hold the button to record a clip, or tap it " +
             "for a photo question."
     const val BAD_RESPONSE = "Couldn't read the server's answer."
+    // HTTP 401 on /ask or /followup: spoken as-is, no "Sorry" wrap.
+    const val APP_TOKEN_REJECTED =
+        "The server didn't accept the app token. Check it in Settings."
 
     fun workingSub(clip: Boolean): String =
         (if (clip) "Clip sent. " else "Photo sent. ") +

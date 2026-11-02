@@ -21,7 +21,7 @@ Requires JDK 17+ and the Android SDK. Point Gradle at the SDK with
   (WhatsApp-voice-note style: press, hold, release to send). The button
   carries a `contentDescription` from day one; recording start/stop pulses
   haptically and status changes are announced via a live-region TextView.
-  CameraX `VideoCapture` wiring, clip upload to `POST /v1/clips`, and
+  CameraX `VideoCapture` wiring, clip upload to `POST /ask`, and
   TextToSpeech readout are TODOs for hackathon time — marked in the code.
 
 ## Permissions

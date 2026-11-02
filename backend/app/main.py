@@ -2,16 +2,15 @@
 
 Request flow (design doc, section 3 "Where the bytes go"):
 
-    Android app --HTTPS--> POST /v1/clips --ffmpeg--> frames + audio
+    Android app --HTTPS--> POST /ask --ffmpeg--> frames + audio
         --> SAM 3.1 --> scene model --> Muse Spark (Model API)
         --> answer, or escalate to a volunteer
 """
 from __future__ import annotations
 
 import asyncio
-import shutil
+import hmac
 from pathlib import Path
-from uuid import uuid4
 
 from fastapi import (
     Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile,
@@ -20,13 +19,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import capture, escalation, metric
 from .pipeline import (
-    FollowupExpired, PipelineError, StageFailed, case_photo, run_ask,
-    run_followup, sweep_ask_store,
+    FollowupExpired, PipelineError, StageFailed, _load_secret, case_photo,
+    run_ask, run_followup, sweep_ask_store,
 )
 
-UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 CONSOLE_PAGE = Path(__file__).resolve().parent / "static" / "volunteer.html"
-ALLOWED_VIDEO_TYPES = {"video/mp4", "video/3gpp", "video/webm"}
 # Failure rule (2026-10-27): a stage that did not run errors the ask
 # (503) with a line the app speaks as-is; the user retries.
 TRY_AGAIN = "Something went wrong — please try again."
@@ -37,6 +34,15 @@ def _stage_failed(e: StageFailed) -> HTTPException:
         "error": "stage_failed", "stage": e.stage,
         "message": TRY_AGAIN, "cause": str(e),
     })
+
+
+def _app_token(given: str | None) -> None:
+    """APP_TOKEN gates /ask and /followup (X-App-Token header, entered
+    in the app's Settings). Unset: the check is off."""
+    want = _load_secret("APP_TOKEN").strip()
+    if want and not hmac.compare_digest(
+            (given or "").encode(), want.encode()):
+        raise HTTPException(status_code=401, detail="bad app token")
 
 
 def _escalation_on() -> None:
@@ -72,27 +78,6 @@ def create_app() -> FastAPI:
     async def health() -> dict:
         return {"status": "ok"}
 
-    @app.post("/v1/clips")
-    async def upload_clip(video: UploadFile = File(...)) -> JSONResponse:
-        """Accept a 5-10s video clip. The ingest pipeline lands here.
-
-        Saves the upload to uploads/ and returns 501 until the pipeline
-        (extract_frames -> ... -> answer_with_muse) is wired up.
-        """
-        if video.content_type not in ALLOWED_VIDEO_TYPES:
-            raise HTTPException(
-                status_code=415,
-                detail=f"unsupported media type: {video.content_type}",
-            )
-        dest = UPLOAD_DIR / f"{uuid4().hex}.mp4"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with dest.open("wb") as f:
-            shutil.copyfileobj(video.file, f)
-        return JSONResponse(
-            status_code=501,
-            content={"status": "not_implemented", "clip_id": dest.stem},
-        )
-
     @app.post("/v1/asks")
     async def ask() -> JSONResponse:
         """Snap & ask: image + question. Wired once the pipeline exists."""
@@ -109,6 +94,7 @@ def create_app() -> FastAPI:
         audio: UploadFile | None = File(None),
         pitch_deg: str | None = Form(None),
         focal_px: str | None = Form(None),
+        x_app_token: str | None = Header(None),
     ) -> JSONResponse:
         """Snap & ask: JPEG photo + optional question -> grounded answer.
 
@@ -120,6 +106,7 @@ def create_app() -> FastAPI:
         signals, question_used, question_source} where behavior is
         ANSWER or ESCALATE.
         """
+        _app_token(x_app_token)
         data = await image.read()
         if not data:
             raise HTTPException(status_code=400, detail="empty image upload")
@@ -157,6 +144,7 @@ def create_app() -> FastAPI:
         ask_id: str = Form(...),
         question: str = Form(""),
         audio: UploadFile | None = File(None),
+        x_app_token: str | None = Header(None),
     ) -> JSONResponse:
         """Follow-up on a cached ask: same media, new question.
 
@@ -165,6 +153,7 @@ def create_app() -> FastAPI:
         unknown or its cache entry expired (ASK_TTL_S, default an hour) — the app then
         says so plainly and offers a fresh ask.
         """
+        _app_token(x_app_token)
         audio_bytes = await audio.read() if audio and audio.filename else None
         # The photo/clip live in the parent ask's capture.
         cap = capture.begin("followup", question or "", audio=audio_bytes,

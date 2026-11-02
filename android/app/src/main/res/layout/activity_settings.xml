@@ -161,6 +161,32 @@
 
         </LinearLayout>
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:labelFor="@id/app_token_field"
+            android:text="@string/settings_app_token"
+            android:textColor="@color/alumbra_ink"
+            android:textSize="18sp" />
+
+        <!-- Visible, not masked: TalkBack users need to hear what they
+             typed. -->
+        <EditText
+            android:id="@+id/app_token_field"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="@drawable/box_type"
+            android:contentDescription="@string/settings_app_token_description"
+            android:hint="@string/settings_app_token_hint"
+            android:importantForAutofill="no"
+            android:inputType="textVisiblePassword"
+            android:padding="12dp"
+            android:textColor="@color/alumbra_ink"
+            android:textColorHint="@color/alumbra_dim"
+            android:textSize="16sp" />
+
         <Button
             android:id="@+id/save_server_button"
             android:layout_width="match_parent"

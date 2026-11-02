@@ -137,7 +137,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         tts.onVoiceUnavailable = {
             runOnUiThread { statusOnly(Spoken.VOICE_UNAVAILABLE) }
         }
-        api = AskApi(Prefs.baseUrl(this))
+        api = AskApi(Prefs.baseUrl(this), Prefs.appToken(this))
         sensorManager =
             getSystemService(SENSOR_SERVICE) as SensorManager
 
@@ -268,7 +268,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
-        api = AskApi(Prefs.baseUrl(this))
+        api = AskApi(Prefs.baseUrl(this), Prefs.appToken(this))
         sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)?.let {
             sensorManager?.registerListener(
                 this, it, SensorManager.SENSOR_DELAY_NORMAL

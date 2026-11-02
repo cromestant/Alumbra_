@@ -249,7 +249,7 @@ class AnswerActivity : AppCompatActivity() {
         pollMs = rec.escalationPollS * 1000L
         deadline = if (resumeAt > 0L) resumeAt else
             SystemClock.elapsedRealtime() + rec.escalationWindowS * 1000L
-        api = AskApi(Prefs.baseUrl(this))
+        api = AskApi(Prefs.baseUrl(this), Prefs.appToken(this))
         findViewById<LinearLayout>(R.id.btnrow_escalated).visibility =
             View.GONE
         findViewById<Button>(R.id.stop_waiting_button).visibility =

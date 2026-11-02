@@ -78,7 +78,7 @@ sealed interface AskOutcome {
  * {base_url}/followup re-runs the pipeline on a cached ask's media with
  * a new question (no image). Unknown response fields are ignored.
  */
-class AskApi(baseUrl: String) {
+class AskApi(baseUrl: String, private val appToken: String = "") {
     private val url = baseUrl.trimEnd('/') + "/ask"
     private val followupUrl = baseUrl.trimEnd('/') + "/followup"
     private val escalationsUrl = baseUrl.trimEnd('/') + "/v1/escalations"
@@ -174,7 +174,9 @@ class AskApi(baseUrl: String) {
         mapGone: Boolean,
         callback: (AskOutcome) -> Unit,
     ) {
-        val request = Request.Builder().url(targetUrl).post(form).build()
+        val request = Request.Builder().url(targetUrl).post(form).apply {
+            if (appToken.isNotEmpty()) header("X-App-Token", appToken)
+        }.build()
         val newCall = client.newCall(request)
         call = newCall
         val startMs = SystemClock.elapsedRealtime()
@@ -215,6 +217,14 @@ class AskApi(baseUrl: String) {
                                     Spoken.ASK_EXPIRED,
                                     "HTTP 410",
                                     expired = true,
+                                )
+                            )
+                        } else if (it.code == 401) {
+                            callback(
+                                AskOutcome.Err(
+                                    Spoken.APP_TOKEN_REJECTED,
+                                    "HTTP 401",
+                                    plain = true,
                                 )
                             )
                         } else if (it.code == 503 || it.code == 502) {

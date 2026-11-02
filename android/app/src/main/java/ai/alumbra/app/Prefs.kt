@@ -15,6 +15,7 @@ object Prefs {
 
     private const val FILE = "alumbra"
     private const val KEY_BASE_URL = "base_url"
+    private const val KEY_APP_TOKEN = "app_token"
     private const val KEY_LANGUAGE = "language"
     private const val KEY_SPEECH_RATE = "speech_rate"
     private const val KEY_HIGH_CONTRAST = "high_contrast"
@@ -30,6 +31,14 @@ object Prefs {
 
     fun setBaseUrl(context: Context, value: String) {
         prefs(context).edit().putString(KEY_BASE_URL, value.trim()).apply()
+    }
+
+    /** The server's APP_TOKEN, entered in Settings; empty sends none. */
+    fun appToken(context: Context): String =
+        prefs(context).getString(KEY_APP_TOKEN, "") ?: ""
+
+    fun setAppToken(context: Context, value: String) {
+        prefs(context).edit().putString(KEY_APP_TOKEN, value.trim()).apply()
     }
 
     fun language(context: Context): String =
